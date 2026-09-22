@@ -1,0 +1,51 @@
+module Beid
+  VERSION: String
+
+  class Error < StandardError
+  end
+
+  class Node
+    attr_reader type: Symbol
+    attr_reader attributes: Hash[Symbol, untyped]
+    attr_reader children: Array[Node]
+    attr_reader range: Range[Integer]
+    attr_reader marker: String?
+
+    def initialize: (type: Symbol, ?attributes: Hash[Symbol, untyped], ?children: Array[Node], range: Range[Integer], ?marker: String?) -> void
+    def text: () -> String?
+  end
+
+  class Document
+    attr_reader source: String
+    attr_reader root: Node
+    attr_reader front_matter: String?
+    attr_reader options: Hash[Symbol, bool]
+    attr_reader diagnostics: Array[String]
+
+    def self.parse: (String text, ?gfm: bool, ?front_matter: bool) -> Document
+    def nodes_at: (Integer offset) -> Array[Node]
+    def node_at: (Integer offset) -> Node?
+    def range_of: (Node node) -> Range[Integer]
+    def position_at: (Integer offset) -> [ Integer, Integer ]
+    def utf16_position_at: (Integer offset) -> [ Integer, Integer ]
+    def valid?: () -> bool
+    def to_s: () -> String
+    def include_node?: (Node node) -> bool
+  end
+
+  module Directive
+    def self.parse: (String html_comment) -> Hash[String, String]?
+    def self.render: (Hash[String, String] values) -> String
+  end
+
+  module Editing
+    def self.replace: (Document document, Node node, String markdown) -> Document
+    def self.replace_text: (Document document, Node node, String text) -> Document
+    def self.insert_after: (Document document, Node node, String markdown) -> Document
+    def self.insert_before: (Document document, Node node, String markdown) -> Document
+    def self.remove: (Document document, Node node) -> Document
+    def self.set_attribute: (Document document, Node node, String | Symbol key, untyped value) -> Document
+    def self.set_directive: (Document document, Node node, String | Symbol key, String value) -> Document
+    def self.move: (Document document, Node node, ?before: Node?, ?after: Node?) -> Document
+  end
+end
