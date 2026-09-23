@@ -7,9 +7,18 @@ module Beid
     REFERENCE_START = /!?\[/
     Reference = Struct.new(:start, :finish, :image, :label, :label_start, :label_end,
                            :reference_label, :definition, keyword_init: true)
+    CodeRun = Struct.new(:start, :finish, :length, keyword_init: true)
+    CodeSpan = Struct.new(:start, :finish, :marker, :text, keyword_init: true)
 
     def initialize(source, base_offset, gfm: true, references: {})
       @source, @base_offset, @gfm, @references = source, base_offset, gfm, references
+      @code_runs = code_runs
+      @code_closers = {}
+      next_run_by_length = {}
+      @code_runs.reverse_each do |run|
+        @code_closers[run.start] = next_run_by_length[run.length]
+        next_run_by_length[run.length] = run
+      end
     end
 
     def parse
@@ -18,7 +27,8 @@ module Beid
       nodes = []
       cursor = 0
       while cursor < @source.length
-        match = TOKEN.match(@source, cursor)
+        match = next_inline_match(cursor)
+        code_span = next_code_span(cursor)
         footnote = /\[\^([^\]]+)\]/.match(@source, cursor) if @gfm
         autolink = AUTOLINK.match(@source, cursor)
         if match && autolink && ((match[3] && autolink.begin(0) < match.end(0) && autolink.end(0) > match.end(0)) ||
@@ -30,7 +40,8 @@ module Beid
           match.end(9) > reference.start && match.end(9) < reference.finish
           match = nil
         end
-        candidates = [[:inline, match], [:footnote, footnote], [:autolink, autolink], [:reference, reference]]
+        candidates = [[:inline, match], [:code, code_span], [:footnote, footnote],
+                      [:autolink, autolink], [:reference, reference]]
           .compact.reject { |_kind, candidate| candidate.nil? }
         kind, candidate = candidates.min_by { |candidate_kind, value| [candidate_start(candidate_kind, value), candidate_priority(candidate_kind)] }
         start = candidate && candidate_start(kind, candidate)
@@ -45,14 +56,12 @@ module Beid
           match = candidate
           nodes << node(:footnote_reference, cursor, match.end(0), "[^",
                         { identifier: match[1] })
+        elsif kind == :code
+          nodes << node(:code_span, cursor, candidate.finish, candidate.marker, text: candidate.text)
         elsif kind == :autolink
           nodes << parse_autolink(candidate)
         elsif kind == :reference
           nodes << parse_reference(candidate)
-        elsif match[1]
-          match = candidate
-          marker = match[1]
-          nodes << node(:code_span, cursor, match.end(0), marker, text: match[2])
         elsif match[3]
           match = candidate
           image = match[3] == "!"
@@ -82,7 +91,7 @@ module Beid
             nodes << text_node(cursor, next_cursor)
           end
         end
-        cursor = kind == :reference ? candidate.finish : candidate.end(0)
+        cursor = %i[reference code].include?(kind) ? candidate.finish : candidate.end(0)
       end
       nodes
     end
@@ -90,11 +99,53 @@ module Beid
     private
 
     def candidate_start(kind, candidate)
-      kind == :reference ? candidate.start : candidate.begin(0)
+      %i[reference code].include?(kind) ? candidate.start : candidate.begin(0)
     end
 
     def candidate_priority(kind)
-      { inline: 0, footnote: 1, autolink: 2, reference: 3 }.fetch(kind)
+      { inline: 0, code: 1, footnote: 2, autolink: 3, reference: 4 }.fetch(kind)
+    end
+
+    def next_inline_match(cursor)
+      match = TOKEN.match(@source, cursor)
+      while match && match[1]
+        next_start = match.begin(1)
+        next_start += 1 while next_start < @source.length && @source[next_start] == "`"
+        match = TOKEN.match(@source, next_start)
+      end
+      match
+    end
+
+    def next_code_span(cursor)
+      index = @code_runs.bsearch_index { |run| run.start >= cursor } || @code_runs.length
+      while index < @code_runs.length
+        opening = @code_runs[index]
+        if escaped?(opening.start)
+          index += 1
+          next
+        end
+        closing = @code_closers[opening.start]
+        if closing
+          text = @source[opening.finish...closing.start].gsub(/\r\n|\r|\n/, " ")
+          text = text[1...-1] if text.start_with?(" ") && text.end_with?(" ") && !text.match?(/\A +\z/)
+          marker = @source[opening.start...opening.finish]
+          return CodeSpan.new(start: opening.start, finish: closing.finish, marker: marker, text: text)
+        end
+        index += 1
+      end
+      nil
+    end
+
+    def code_runs
+      runs = []
+      index = 0
+      while (start = @source.index("`", index))
+        finish = start + 1
+        finish += 1 while finish < @source.length && @source[finish] == "`"
+        runs << CodeRun.new(start: start, finish: finish, length: finish - start)
+        index = finish
+      end
+      runs
     end
 
     def parse_autolink(match)

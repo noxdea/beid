@@ -73,6 +73,23 @@ RSpec.describe Beid do
       expect(document.to_s).to eq(source)
     end
 
+    it "matches exact CommonMark code-span delimiter runs and normalizes their text" do
+      # The first four samples cover CommonMark 0.31.2 examples 330, 331, 340, and 349.
+      [
+        ["` `` `\n", "``", "` `` `"],
+        ["`  ``  `\n", " `` ", "`  ``  `"],
+        ["` foo `` bar `\n", "foo `` bar", "` foo `` bar `"],
+        ["`foo``bar``\n", "bar", "``bar``"],
+        ["`line\nbreak`\n", "line break", "`line\nbreak`"]
+      ].each do |source, expected_text, expected_source|
+        document = Beid::Document.parse(source, gfm: false, front_matter: false)
+        code_spans = document.root.children.flat_map(&:children).select { |node| node.type == :code_span }
+
+        expect(code_spans.map { |node| node.attributes[:text] }).to eq([expected_text])
+        expect(document.source.byteslice(code_spans.first.range)).to eq(expected_source)
+      end
+    end
+
     it "resolves reference links, collapsed references, images, and autolinks" do
       source = "[Guide][docs], [reference][], [shortcut], ![badge][img], <https://example.test/a?q=1>, <dev+bot@example.test>\n\n[DOCS]: /guides \"Quick guide\"\n[reference]: /reference\n[shortcut]: /short\n[img]: /badge.png\n"
       document = described_class.parse(source, gfm: false, front_matter: false)
