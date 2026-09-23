@@ -73,6 +73,103 @@ RSpec.describe Beid do
       expect(document.to_s).to eq(source)
     end
 
+    it "resolves reference links, collapsed references, images, and autolinks" do
+      source = "[Guide][docs], [reference][], [shortcut], ![badge][img], <https://example.test/a?q=1>, <dev+bot@example.test>\n\n[DOCS]: /guides \"Quick guide\"\n[reference]: /reference\n[shortcut]: /short\n[img]: /badge.png\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      paragraph = document.root.children.first
+      links = paragraph.children.select { |node| %i[link image].include?(node.type) }
+
+      expect(links.map { |node| [node.type, node.attributes[:destination], node.attributes[:title]] }).to eq([
+        [:link, "/guides", "Quick guide"],
+        [:link, "/reference", nil],
+        [:link, "/short", nil],
+        [:image, "/badge.png", nil],
+        [:link, "https://example.test/a?q=1", nil],
+        [:link, "mailto:dev+bot@example.test", nil]
+      ])
+      expect(links.map { |node| document.source.byteslice(node.range) }).to eq([
+        "[Guide][docs]", "[reference][]", "[shortcut]", "![badge][img]",
+        "<https://example.test/a?q=1>", "<dev+bot@example.test>"
+      ])
+      expect(links.all? do |node|
+        child = node.children.first
+        child.nil? || (node.range.begin <= child.range.begin && child.range.end <= node.range.end)
+      end).to be(true)
+      definitions = document.root.children.select { |node| node.type == :link_definition }
+      expect(definitions.map { |node| node.attributes[:normalized_label] }).to eq(%w[docs reference shortcut img])
+    end
+
+    it "keeps nested list levels as nested nodes with contained byte ranges" do
+      source = "- parent\n  - child\n    - grandchild\n  - sibling\n- root sibling\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      list = document.root.children.first
+      parent_item = list.children.first
+      child_list = parent_item.children.find { |node| node.type == :list }
+      grandchild_list = child_list.children.first.children.find { |node| node.type == :list }
+
+      expect(list.children.length).to eq(2)
+      expect(child_list.children.length).to eq(2)
+      expect(grandchild_list.children.length).to eq(1)
+      expect(document.source.byteslice(child_list.range)).to eq("  - child\n    - grandchild\n  - sibling\n")
+      expect(document.source.byteslice(grandchild_list.range)).to eq("    - grandchild\n")
+      expect(document.to_s).to eq(source)
+    end
+
+    it "uses the first reference definition and ignores definitions inside code fences" do
+      source = "[item][key]\n\n[key]: /first\n[key]: /second\n\n```\n[hidden]: /code\n```\n\n[hidden]\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      links = document.root.children.flat_map { |node| node.children.select { |child| child.type == :link } }
+      definitions = document.root.children.select { |node| node.type == :link_definition }
+
+      expect(links.map { |node| node.attributes[:destination] }).to eq(["/first"])
+      expect(definitions.map { |node| node.attributes[:effective] }).to eq([true, false])
+      expect(document.to_s).to eq(source)
+    end
+
+    it "does not treat a link definition as interrupting a paragraph" do
+      source = "Foo\n[bar]: /baz\n\n[bar]\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      paragraphs = document.root.children.select { |node| node.type == :paragraph }
+
+      expect(document.root.children.map(&:type)).to eq(%i[paragraph paragraph])
+      expect(document.root.children.flat_map(&:children).none? { |node| node.type == :link_definition }).to be(true)
+      expect(paragraphs.map { |node| document.source.byteslice(node.range) }).to eq(["Foo\n[bar]: /baz\n", "[bar]\n"])
+      expect(document.root.children.last.children.map(&:type)).to eq([:text])
+      expect(document.to_s).to eq(source)
+    end
+
+    it "prefers valid inline links but falls back to a shortcut reference after an invalid inline form" do
+      source = "[foo]() [foo](not a link)\n\n[foo]: /reference\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      links = document.root.children.first.children.select { |node| node.type == :link }
+
+      expect(links.map { |node| [node.attributes[:destination], document.source.byteslice(node.range)] }).to eq([
+        ["", "[foo]()"], ["/reference", "[foo]"]
+      ])
+      expect(document.to_s).to eq(source)
+    end
+
+    it "parses multiline reference destinations and titles without losing their ranges" do
+      samples = [
+        ["   [foo]: \n      /url  \n           'the title'  \n\n[foo]\n", "/url", "the title", "/url"],
+        ["[Foo bar]:\n<my url>\n\'title\'\n\n[Foo bar]\n", "my url", "title", "my url"],
+        ["[foo]: /url '\ntitle\nline1\nline2\n'\n\n[foo]\n", "/url", "\ntitle\nline1\nline2\n", "/url"],
+        ["[foo]:\n/url\n\n[foo]\n", "/url", nil, "/url"]
+      ]
+
+      samples.each do |source, destination, title, raw_destination|
+        document = described_class.parse(source, gfm: false, front_matter: false)
+        definition = document.root.children.find { |node| node.type == :link_definition }
+        link = document.root.children.flat_map(&:children).find { |node| node.type == :link }
+
+        expect([definition.attributes[:destination], definition.attributes[:title]]).to eq([destination, title])
+        expect(document.source.byteslice(definition.attributes[:destination_range])).to eq(raw_destination)
+        expect(link.attributes.values_at(:destination, :title)).to eq([destination, title])
+        expect(document.source.byteslice(link.attributes[:definition_range])).to eq(document.source.byteslice(definition.range))
+        expect(document.to_s).to eq(source)
+      end
+    end
+
     it "recognizes GFM nodes and respects parser options" do
       document = described_class.parse("- [x] done\n\n~~old~~ and [^id]\n\n[^id]: note\n\n| a | b |\n| --- | --- |\n| c | d |\n")
       item = document.root.children.first.children.first

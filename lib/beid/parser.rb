@@ -2,6 +2,9 @@
 
 module Beid
   class Parser
+    LINK_DEFINITION_START = /\A {0,3}\[([^\]\n]+)\]:[ \t]*(.*)\z/
+    LINK_DESTINATION = /\A(<[^>\n]*>|(?:\\.|[^\s])+)(.*)\z/
+
     Line = Struct.new(:text, :ending, :start, :finish, keyword_init: true) do
       def blank?
         text.match?(/\A[ \t]*\z/)
@@ -11,6 +14,7 @@ module Beid
     def initialize(source, gfm: true, front_matter: true)
       @source, @gfm, @front_matter = source, gfm, front_matter
       @lines = source.valid_encoding? ? lines_for(source) : []
+      @link_definitions, @link_definition_lines = collect_link_definitions
     end
 
     def parse
@@ -73,6 +77,7 @@ module Beid
       return parse_indented_code(index) if text.start_with?("    ", "\t")
       return [parse_comment_directive(index), index + 1] if directive_comment(text)
       return parse_html(index) if html_block_start?(text)
+      return parse_link_definition(index) if @link_definition_lines.key?(index)
       return parse_table(index) if @gfm && table_separator?(@lines[index + 1]&.text) && text.include?("|")
       return parse_footnote(index) if @gfm && text.match?(/\A {0,3}\[\^[^\]]+\]:/)
       return [parse_heading(index), index + 1] if (match = /\A {0,3}(\#{1,6})(?:[ \t]+|$)(.*)\z/.match(text))
@@ -143,17 +148,17 @@ module Beid
       [make(:block_quote, @lines[first].start, last.finish, marker: ">", children: children), index]
     end
 
-    def parse_list(index)
+    def parse_list(index, nested: false)
       first = index
-      initial = list_marker(@lines[index].text)
+      initial = list_marker(@lines[index].text, max_indent: nested ? nil : 3)
       base_indent, list_marker_text, ordered = initial
       items = []
       while index < @lines.length
-        current = list_marker(@lines[index].text)
+        current = list_marker(@lines[index].text, max_indent: nested ? nil : 3)
         break unless same_list?(current, initial)
 
         line = @lines[index]
-        marker_match = /\A {0,3}(?:([-+*])|(\d{1,9}[.)]))[ \t]+(.*)\z/.match(line.text)
+        marker_match = /\A[ \t]*(?:([-+*])|(\d{1,9}[.)]))[ \t]+(.*)\z/.match(line.text)
         marker = marker_match[1] || marker_match[2]
         content = marker_match[3]
         content_start = line.start + byte_length(line.text[0...marker_match.begin(3)])
@@ -172,15 +177,53 @@ module Beid
                                        marker: task[1])) if task
         item_end = line.finish
         index += 1
-        while index < @lines.length && continuation_line?(@lines[index], base_indent)
-          item_end = @lines[index].finish
-          index += 1
+        while index < @lines.length
+          if @lines[index].blank?
+            next_index = index + 1
+            next_index += 1 while next_index < @lines.length && @lines[next_index].blank?
+            marker_after_blank = list_marker(@lines[next_index]&.text.to_s, max_indent: nil)
+            if marker_after_blank && marker_after_blank[0] > base_indent
+              index = next_index
+              child_list, index = parse_list(index, nested: true)
+              item_children << child_list
+              item_end = child_list.range.end
+              next
+            end
+            break
+          end
+
+          child_marker = list_marker(@lines[index].text, max_indent: nil)
+          if child_marker && child_marker[0] > base_indent
+            child_list, index = parse_list(index, nested: true)
+            item_children << child_list
+            item_end = child_list.range.end
+          elsif continuation_line?(@lines[index], base_indent)
+            item_end = @lines[index].finish
+            index += 1
+          else
+            break
+          end
         end
         items << make(:list_item, line.start, item_end, marker: marker, attributes: attrs, children: item_children)
       end
       list_type = ordered ? :ordered_list : :list
       [make(list_type, @lines[first].start, items.last.range.end, marker: list_marker_text,
             attributes: { ordered: ordered, start: initial[3] }, children: items), index]
+    end
+
+    def parse_link_definition(index)
+      line = @lines[index]
+      definition = @link_definition_lines.fetch(index)
+      node = make(:link_definition, line.start, definition[:range].end, marker: "[", attributes: {
+        label: definition[:label],
+        normalized_label: definition[:normalized_label],
+        destination: definition[:destination],
+        title: definition[:title],
+        destination_range: definition[:destination_range],
+        title_range: definition[:title_range],
+        effective: definition[:effective]
+      })
+      [node, definition[:last_index] + 1]
     end
 
     def parse_indented_code(index)
@@ -322,14 +365,192 @@ module Beid
     end
 
     def inline_nodes(text, offset)
-      InlineParser.new(text, offset, gfm: @gfm).parse
+      InlineParser.new(text, offset, gfm: @gfm, references: @link_definitions).parse
     end
 
-    def list_marker(text)
-      match = /\A( {0,3})([-+*]|(\d{1,9}[.)]))[ \t]+/.match(text)
-      return nil unless match
+    def collect_link_definitions
+      definitions = {}
+      definition_lines = {}
+      fence = nil
+      html_block = false
+      previous_definition_end = nil
+      front_matter_end = if @front_matter && @lines.first&.text == "---"
+        (1...@lines.length).find { |index| ["---", "..."].include?(@lines[index].text) }
+      end
+      index = 0
+      while index < @lines.length
+        if front_matter_end && index <= front_matter_end
+          index += 1
+          next
+        end
+        line = @lines[index]
+        if fence
+          fence = nil if line.text.match?(/\A {0,3}#{Regexp.escape(fence[0])}{#{fence.length},}[ \t]*\z/)
+          index += 1
+          next
+        end
 
-      [match[1].length, match[2], !match[3].nil?, match[3]&.to_i || 0]
+        if (opening = /\A {0,3}(`{3,}|~{3,})/.match(line.text))
+          fence = opening[1]
+          index += 1
+          next
+        end
+        if html_block
+          html_block = false if line.blank?
+          index += 1
+          next
+        end
+        if !directive_comment(line.text) && html_block_start?(line.text)
+          html_block = true
+          index += 1
+          next
+        end
+        if line.text.start_with?("    ", "\t") || (@gfm && line.text.match?(/\A {0,3}\[\^[^\]]+\]:/))
+          index += 1
+          next
+        end
+        if index.positive? && !@lines[index - 1].blank? && previous_definition_end != index - 1 &&
+          !link_definition_block_boundary?(@lines[index - 1].text)
+          index += 1
+          next
+        end
+
+        definition = link_definition_at(index)
+        unless definition
+          index += 1
+          next
+        end
+
+        normalized = normalize_reference_label(definition[:label])
+        definition[:normalized_label] = normalized
+        definition[:effective] = !definitions.key?(normalized)
+        definitions[normalized] ||= definition
+        definition_lines[index] = definition
+        previous_definition_end = definition[:last_index]
+        index = definition[:last_index] + 1
+      end
+      [definitions.freeze, definition_lines.freeze]
+    end
+
+    def link_definition_at(index)
+      line = @lines[index]
+      prefix = LINK_DEFINITION_START.match(line.text)
+      return unless prefix
+
+      content = prefix[2]
+      content_index = prefix.begin(2)
+      destination_line = index
+      if content.strip.empty?
+        destination_line += 1
+        return if destination_line >= @lines.length || @lines[destination_line].blank?
+
+        content = @lines[destination_line].text
+        content_index = 0
+        content_index += 1 while content[content_index]&.match?(/[ \t]/)
+        content = content[content_index..]
+      end
+
+      destination_match = LINK_DESTINATION.match(content)
+      return unless destination_match
+
+      raw_destination = destination_match[1]
+      raw_destination_value = raw_destination.start_with?("<") ? raw_destination[1...-1] : raw_destination
+      destination = unescape_punctuation(raw_destination_value)
+      destination_start_index = content_index + destination_match.begin(1)
+      destination_start = @lines[destination_line].start + byte_length(@lines[destination_line].text[0...destination_start_index])
+      destination_start += 1 if raw_destination.start_with?("<")
+      destination_range = destination_start...(destination_start + byte_length(raw_destination_value))
+      tail_start = content_index + destination_match.end(1)
+      tail = destination_match[2]
+      last_index = destination_line
+      title = nil
+      title_range = nil
+
+      unless tail.strip.empty?
+        spacing = tail[/\A[ \t]*/].to_s.length
+        return if spacing.zero?
+
+        title_start = tail_start + spacing
+        title_data = link_title_at(destination_line, title_start)
+        return unless title_data
+
+        title, title_range, last_index = title_data
+      else
+        next_index = destination_line + 1
+        if next_index < @lines.length && !@lines[next_index].blank?
+          leading = @lines[next_index].text[/\A[ \t]*/].to_s.length
+          title_data = link_title_at(next_index, leading)
+          if title_data
+            title, title_range, last_index = title_data
+          end
+        end
+      end
+
+      {
+        label: prefix[1], destination: destination, title: title,
+        range: line.start...@lines[last_index].finish,
+        destination_range: destination_range, title_range: title_range,
+        last_index: last_index
+      }
+    end
+
+    def link_title_at(line_index, character_index)
+      opener = @lines[line_index].text[character_index]
+      closer = { "\"" => "\"", "'" => "'", "(" => ")" }[opener]
+      return unless closer
+
+      title_start = @lines[line_index].start + byte_length(@lines[line_index].text[0...(character_index + 1)])
+      index = line_index
+      position = character_index + 1
+      loop do
+        line = @lines[index]
+        while position < line.text.length
+          if line.text[position] == closer && !escaped_in_line?(line.text, position)
+            return unless line.text[(position + 1)..].match?(/\A[ \t]*\z/)
+
+            title_end = line.start + byte_length(line.text[0...position])
+            raw_title = @source.byteslice(title_start...title_end)
+            return [unescape_punctuation(raw_title), title_start...title_end, index]
+          end
+          position += 1
+        end
+        index += 1
+        return if index >= @lines.length || @lines[index].blank?
+
+        position = 0
+      end
+    end
+
+    def escaped_in_line?(text, index)
+      slashes = 0
+      index -= 1
+      while index >= 0 && text[index] == "\\"
+        slashes += 1
+        index -= 1
+      end
+      slashes.odd?
+    end
+
+    def link_definition_block_boundary?(text)
+      text.match?(/\A {0,3}(?:\#{1,6}(?:[ \t]|$)|>|`{3,}|~{3,}|(?:[-+*]|\d{1,9}[.)])[ \t]+|(?:[-*_][ \t]*){3,}|<(?!--)|<\/?(?:address|article|aside|blockquote|div|h[1-6]|hr|ol|p|pre|section|table|ul)(?:\s|\x2f?>))/i) ||
+        text.match?(/\A {0,3}(?:=+|\*{3,}|-{3,})[ \t]*\z/)
+    end
+
+    def normalize_reference_label(label)
+      unescape_punctuation(label).gsub(/[[:space:]]+/, " ").strip.downcase(:fold)
+    end
+
+    def unescape_punctuation(text)
+      text&.gsub(/\\([[:punct:]])/, "\\1")
+    end
+
+    def list_marker(text, max_indent: 3)
+      match = /\A([ \t]*)([-+*]|(\d{1,9}[.)]))[ \t]+/.match(text)
+      return nil unless match
+      indent = indentation(match[1])
+      return nil if max_indent && indent > max_indent
+
+      [indent, match[2], !match[3].nil?, match[3]&.to_i || 0]
     end
 
     def same_list?(left, right)
@@ -340,10 +561,15 @@ module Beid
 
     def continuation_line?(line, indent)
       return false if line.blank?
-      marker = list_marker(line.text)
+      marker = list_marker(line.text, max_indent: nil)
       return marker && marker[0] > indent if marker
 
-      line.text.match?(/\A {#{indent + 2},}\S/)
+      whitespace = line.text[/\A[ \t]*/].to_s
+      indentation(whitespace) >= indent + 2 && line.text.length > whitespace.length
+    end
+
+    def indentation(whitespace)
+      whitespace.each_char.reduce(0) { |column, char| char == "\t" ? (column / 4 + 1) * 4 : column + 1 }
     end
 
     def interrupting?(text)
