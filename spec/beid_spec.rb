@@ -46,6 +46,23 @@ RSpec.describe Beid do
       expect(Beid::Editing.set_attribute(setext_document, setext, :level, 2).to_s).to eq("A *setext* heading\n---\n")
     end
 
+    it "exposes inline constructs and nested source ranges beside punctuation" do
+      source = "日本語 *emphasis*, **strong**! ~~deleted~~. [**linked**](https://example.test). ![alt](image.png). `code`."
+      document = described_class.parse(source)
+      paragraph = document.root.children.first
+      constructs = paragraph.children.select { |node| %i[emphasis strong strikethrough link image code_span].include?(node.type) }
+
+      expect(constructs.map(&:type)).to eq(%i[emphasis strong strikethrough link image code_span])
+      expect(constructs.map { |node| document.source.byteslice(node.range) }).to eq([
+        "*emphasis*", "**strong**", "~~deleted~~", "[**linked**](https://example.test)",
+        "![alt](image.png)", "`code`"
+      ])
+      nested_strong = constructs[3].children.first
+      expect(nested_strong.type).to eq(:strong)
+      expect(document.source.byteslice(nested_strong.range)).to eq("**linked**")
+      expect(document.to_s).to eq(source)
+    end
+
     it "recognizes GFM nodes and respects parser options" do
       document = described_class.parse("- [x] done\n\n~~old~~ and [^id]\n\n[^id]: note\n\n| a | b |\n| --- | --- |\n| c | d |\n")
       item = document.root.children.first.children.first
