@@ -199,6 +199,17 @@ RSpec.describe Beid do
       expect(definitions.map { |node| node.attributes[:normalized_label] }).to eq(%w[docs reference shortcut img])
     end
 
+    it "keeps an autolink that crosses a malformed inline-link candidate" do
+      source = "[foo<https://example.com/?search=](uri)>\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      paragraph = document.root.children.first
+      link = paragraph.children.find { |node| node.type == :link }
+
+      expect(link.attributes[:autolink]).to be(true)
+      expect(link.attributes[:destination]).to eq("https://example.com/?search=](uri)")
+      expect(document.to_s).to eq(source)
+    end
+
     it "keeps nested list levels as nested nodes with contained byte ranges" do
       source = "- parent\n  - child\n    - grandchild\n  - sibling\n- root sibling\n"
       document = described_class.parse(source, gfm: false, front_matter: false)
@@ -250,6 +261,17 @@ RSpec.describe Beid do
         item.range.begin <= node.range.begin && node.range.end <= item.range.end
       end).to be(true)
       expect(document.source.byteslice(item.range)).to eq(source)
+      expect(document.to_s).to eq(source)
+    end
+
+    it "parses empty list markers with indented continuation blocks" do
+      source = "-\n  foo\n-\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      list = document.root.children.first
+
+      expect(list.type).to eq(:list)
+      expect(list.children.map { |item| item.children.map(&:type) }).to eq([[:paragraph], []])
+      expect(list.children.first.children.first.children.first.attributes[:text]).to eq("foo")
       expect(document.to_s).to eq(source)
     end
 
@@ -316,6 +338,7 @@ RSpec.describe Beid do
       samples = [
         ["   [foo]: \n      /url  \n           'the title'  \n\n[foo]\n", "/url", "the title", "/url"],
         ["[Foo bar]:\n<my url>\n\'title\'\n\n[Foo bar]\n", "my url", "title", "my url"],
+        ["[Foo\n  bar]: /url\n\n[Baz][Foo bar]\n", "/url", nil, "/url"],
         ["[foo]: /url '\ntitle\nline1\nline2\n'\n\n[foo]\n", "/url", "\ntitle\nline1\nline2\n", "/url"],
         ["[foo]:\n/url\n\n[foo]\n", "/url", nil, "/url"]
       ]

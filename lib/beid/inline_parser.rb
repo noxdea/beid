@@ -12,6 +12,8 @@ module Beid
     CodeSpan = Struct.new(:start, :finish, :marker, :text, keyword_init: true)
     Break = Struct.new(:start, :finish, :type, :marker, keyword_init: true)
     DelimiterMatch = Struct.new(:start, :finish, :marker, :inner_start, :inner_finish, keyword_init: true)
+    InlineLink = Struct.new(:start, :finish, :image, :label, :label_start, :label_finish,
+                            :destination, :destination_range, :title, :title_range, keyword_init: true)
 
     def initialize(source, base_offset, gfm: true, references: {})
       @source, @base_offset, @gfm, @references = source, base_offset, gfm, references
@@ -31,6 +33,7 @@ module Beid
       cursor = 0
       while cursor < @source.length
         match = next_inline_match(cursor)
+        inline_link = next_inline_link(cursor)
         code_span = next_code_span(cursor)
         line_break = next_line_break(cursor)
         html_inline = next_html_inline(cursor)
@@ -43,6 +46,22 @@ module Beid
           autolink.begin(0) <= match.inner_finish && match.inner_finish < autolink.end(0)
           match = nil
         end
+        if inline_link && autolink && inline_link.start < autolink.begin(0) &&
+          autolink.begin(0) < inline_link.finish && inline_link.finish < autolink.end(0)
+          inline_link = nil
+        end
+        if inline_link && code_span && inline_link.start < code_span.start &&
+          code_span.start < inline_link.finish && inline_link.finish < code_span.finish
+          inline_link = nil
+        end
+        if inline_link && html_inline && inline_link.start < html_inline.begin(0) &&
+          html_inline.begin(0) < inline_link.finish && inline_link.finish < html_inline.end(0)
+          inline_link = nil
+        end
+        if inline_link && match.is_a?(DelimiterMatch) && match.start < inline_link.start &&
+          inline_link.start < match.inner_finish && match.inner_finish <= inline_link.label_finish
+          match = nil
+        end
         reference = next_reference(cursor)
         if match.is_a?(MatchData) && match[8] && reference && match.begin(0) < reference.start &&
           match.end(9) > reference.start && match.end(9) < reference.finish
@@ -51,7 +70,16 @@ module Beid
           match.inner_finish > reference.start && match.inner_finish < reference.finish
           match = nil
         end
-        candidates = [[:inline, match], [:code, code_span], [:break, line_break], [:html, html_inline], [:footnote, footnote],
+        if reference && code_span && reference.start < code_span.start &&
+          code_span.start < reference.finish && reference.finish < code_span.finish
+          reference = nil
+        end
+        if reference && html_inline && reference.start < html_inline.begin(0) &&
+          html_inline.begin(0) < reference.finish && reference.finish < html_inline.end(0)
+          reference = nil
+        end
+        candidates = [[:inline_link, inline_link], [:inline, match], [:code, code_span], [:break, line_break],
+                      [:html, html_inline], [:footnote, footnote],
                       [:autolink, autolink], [:reference, reference]]
           .compact.reject { |_kind, candidate| candidate.nil? }
         kind, candidate = candidates.min_by { |candidate_kind, value| [candidate_start(candidate_kind, value), candidate_priority(candidate_kind)] }
@@ -71,6 +99,22 @@ module Beid
           nodes << node(candidate.type, candidate.start, candidate.finish, candidate.marker)
         elsif kind == :html
           nodes << node(:html_inline, candidate.begin(0), candidate.end(0), nil, text: candidate[0])
+        elsif kind == :inline_link
+          image = candidate.image
+          children = if image
+            []
+          else
+            InlineParser.new(candidate.label, @base_offset + byte_offset(candidate.label_start),
+                             gfm: @gfm, references: @references).parse
+          end
+          nodes << node(image ? :image : :link, candidate.start, candidate.finish, image ? "![" : "[", {
+            label: candidate.label,
+            destination: candidate.destination,
+            title: candidate.title,
+            destination_range: range_for_offsets(*candidate.destination_range),
+            title_range: candidate.title_range && range_for_offsets(*candidate.title_range),
+            label_range: range_for_offsets(candidate.label_start, candidate.label_finish)
+          }, children)
         elsif kind == :code
           nodes << node(:code_span, cursor, candidate.finish, candidate.marker, text: candidate.text)
         elsif candidate.is_a?(DelimiterMatch)
@@ -128,7 +172,7 @@ module Beid
             nodes << text_node(cursor, next_cursor)
           end
         end
-        cursor = %i[reference code break].include?(kind) || candidate.is_a?(DelimiterMatch) ? candidate.finish : candidate.end(0)
+        cursor = %i[inline_link reference code break].include?(kind) || candidate.is_a?(DelimiterMatch) ? candidate.finish : candidate.end(0)
       end
       nodes
     end
@@ -136,13 +180,13 @@ module Beid
     private
 
     def candidate_start(kind, candidate)
-      return candidate.start if %i[reference code break].include?(kind) || candidate.is_a?(DelimiterMatch)
+      return candidate.start if %i[inline_link reference code break].include?(kind) || candidate.is_a?(DelimiterMatch)
 
       candidate.begin(0)
     end
 
     def candidate_priority(kind)
-      { inline: 0, code: 1, break: 2, html: 3, footnote: 4, autolink: 5, reference: 6 }.fetch(kind)
+      { inline_link: 0, inline: 1, code: 2, break: 3, html: 4, footnote: 5, autolink: 6, reference: 7 }.fetch(kind)
     end
 
     def next_inline_match(cursor)
@@ -157,6 +201,10 @@ module Beid
           return delimiter_match if delimiter_match
 
           match = TOKEN.match(@source, match.begin(8) + match[8].length)
+        elsif match[3]
+          # Direct links are parsed by inline_link_at so malformed link syntax
+          # cannot be accepted by the older, more permissive token expression.
+          match = TOKEN.match(@source, match.begin(0) + 1)
         elsif escaped?(match.begin(0))
           match = TOKEN.match(@source, match.end(0))
         else
@@ -164,6 +212,154 @@ module Beid
         end
       end
       match
+    end
+
+    def next_inline_link(cursor)
+      search = cursor
+      while (start = @source.index(REFERENCE_START, search))
+        image = @source[start] == "!"
+        bracket = start + (image ? 1 : 0)
+        closing = closing_bracket(bracket)
+        if closing
+          link = inline_link_at(start, image, bracket, closing)
+          return link if link && (image || !nested_inline_link?(bracket + 1, closing))
+        end
+        search = start + 1
+      end
+      nil
+    end
+
+    def inline_link_at(start, image, bracket, closing)
+      opening_paren = closing + 1
+      return unless @source[opening_paren] == "("
+
+      cursor = skip_link_whitespace(opening_paren + 1)
+      destination, destination_range, cursor = link_destination(cursor)
+      return unless destination_range
+
+      whitespace_end = skip_link_whitespace(cursor)
+      title = nil
+      title_range = nil
+      if whitespace_end > cursor && ["\"", "'", "("].include?(@source[whitespace_end])
+        title_data = link_title(whitespace_end)
+        return unless title_data
+
+        title, title_range, cursor = title_data
+        cursor = skip_link_whitespace(cursor)
+      else
+        cursor = whitespace_end
+      end
+      return unless @source[cursor] == ")"
+
+      InlineLink.new(start: start, finish: cursor + 1, image: image,
+                     label: @source[(bracket + 1)...closing], label_start: bracket + 1,
+                     label_finish: closing, destination: unescape_punctuation(destination),
+                     destination_range: destination_range, title: title && unescape_punctuation(title),
+                     title_range: title_range)
+    end
+
+    def link_destination(cursor)
+      if @source[cursor] == "<"
+        destination_start = cursor + 1
+        index = destination_start
+        while index < @source.length
+          character = @source[index]
+          return unless character && !character.match?(/[\r\n]/)
+          return if character == "<" && !escaped?(index)
+          return if character == ">" && escaped?(index)
+          break if character == ">"
+
+          index += 1
+        end
+        return unless @source[index] == ">"
+
+        return [@source[destination_start...index], [destination_start, index], index + 1]
+      end
+
+      start = cursor
+      index = cursor
+      depth = 0
+      while index < @source.length
+        character = @source[index]
+        break if character.match?(/[ \t\r\n]/)
+        if character == "\\" && index + 1 < @source.length
+          index += 2
+          next
+        elsif character == "<"
+          return
+        elsif character == "("
+          depth += 1
+          return if depth > 32
+        elsif character == ")"
+          break if depth.zero?
+
+          depth -= 1
+        end
+        index += 1
+      end
+      return unless depth.zero?
+
+      [@source[start...index], [start, index], index]
+    end
+
+    def link_title(cursor)
+      opening = @source[cursor]
+      closer = { "\"" => "\"", "'" => "'", "(" => ")" }[opening]
+      return unless closer
+
+      start = cursor + 1
+      index = start
+      depth = 1
+      while index < @source.length
+        character = @source[index]
+        if character == "\\" && index + 1 < @source.length
+          index += 2
+          next
+        elsif character == closer
+          if opening != "(" || (depth -= 1).zero?
+            return [@source[start...index], [start, index], index + 1]
+          end
+        elsif opening == "(" && character == "("
+          depth += 1
+        end
+        index += 1
+      end
+      nil
+    end
+
+    def nested_inline_link?(start, finish)
+      search = start
+      while (nested_start = @source.index(REFERENCE_START, search))
+        break if nested_start >= finish
+
+        next_search = nested_start + 1
+        if @source[nested_start] != "!" && (nested_start.zero? || @source[nested_start - 1] != "!")
+          closing = closing_bracket(nested_start)
+          if closing && closing < finish
+            return true if inline_link_at(nested_start, false, nested_start, closing)
+
+            suffix = closing + 1
+            if @source[suffix] == "["
+              reference_end = closing_bracket(suffix)
+              if reference_end && reference_end < finish
+                label = @source[(suffix + 1)...reference_end]
+                label = @source[(nested_start + 1)...closing] if label.empty?
+                return true if @references.key?(normalize_reference_label(label))
+              end
+            else
+              label = @source[(nested_start + 1)...closing]
+              return true if @references.key?(normalize_reference_label(label))
+            end
+          end
+        end
+        search = next_search
+      end
+      false
+    end
+
+    def skip_link_whitespace(index)
+      index += 1 while index < @source.length && @source[index].match?(/[ \t\r\n]/)
+      index
     end
 
     def find_delimiter_match(match)
@@ -385,6 +581,11 @@ module Beid
           next
         end
 
+        if !image && nested_inline_link?(label_start, label_end)
+          search = start + 1
+          next
+        end
+
         definition = @references[normalize_reference_label(reference_label)]
         return Reference.new(start: start, finish: finish, image: image, label: label,
                              label_start: label_start, label_end: label_end,
@@ -424,12 +625,11 @@ module Beid
     end
 
     def reference_suffix_start(index)
-      whitespace = /\A[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)?/.match(@source[index..])
-      index + whitespace[0].length
+      index
     end
 
     def normalize_reference_label(label)
-      label.gsub(/\\([[:punct:]])/, "\\1").gsub(/[[:space:]]+/, " ").strip.downcase(:fold)
+      label.gsub(/[[:space:]]+/, " ").strip.downcase(:fold)
     end
 
     def unescape_punctuation(text)

@@ -2,7 +2,7 @@
 
 module Beid
   class Parser
-    LINK_DEFINITION_START = /\A {0,3}\[([^\]\n]+)\]:[ \t]*(.*)\z/
+    LINK_DEFINITION_START = /\A {0,3}\[((?:\\[[:punct:]]|[^\[\]\n])+)\]:[ \t]*(.*)\z/
     LINK_DESTINATION = /\A(<[^>\n]*>|(?:\\.|[^\s])+)(.*)\z/
 
     Line = Struct.new(:text, :ending, :start, :finish, keyword_init: true) do
@@ -172,12 +172,17 @@ module Beid
         break unless same_list?(current, initial)
 
         line = @lines[index]
-        marker_match = /\A[ \t]*(?:([-+*])|(\d{1,9}[.)]))[ \t]+(.*)\z/.match(line.text)
+        marker_match = /\A[ \t]*(?:([-+*])|(\d{1,9}[.)]))(?:([ \t]+)(.*)|\z)/.match(line.text)
         marker = marker_match[1] || marker_match[2]
-        content = marker_match[3]
-        content_prefix = line.text[0...marker_match.begin(3)]
+        content = marker_match[4].to_s
+        content_prefix = line.text[0...(marker_match.begin(4) || line.text.length)]
         content_start = line.start + byte_length(content_prefix)
         content_indent = indentation(content_prefix)
+        if content.empty?
+          marker_end = marker_match.begin(1) || marker_match.begin(2)
+          marker_end += marker.length
+          content_indent = indentation(line.text[0...marker_end]) + 1
+        end
         content_finish = content_start + byte_length(content)
         task = @gfm && /\A\[([ xX])\](?:[ \t]+|$)(.*)\z/.match(content)
         if task
@@ -189,6 +194,7 @@ module Beid
         fragments = [FragmentLine.new(text: content, ending: line.ending,
                                       source_start: content_start, range_start: content_start)]
         item_end = line.finish
+        has_item_content = !content.empty?
         paragraph_open = paragraph_continuation?(content)
         index += 1
         while index < @lines.length
@@ -201,7 +207,7 @@ module Beid
               index = next_index
               break
             end
-            if next_line && indentation(next_line.text[/\A[ \t]*/].to_s) >= content_indent
+            if has_item_content && next_line && indentation(next_line.text[/\A[ \t]*/].to_s) >= content_indent
               while index < next_index
                 blank = @lines[index]
                 blank_text, blank_start = strip_indent(blank, content_indent)
@@ -224,12 +230,14 @@ module Beid
             text, source_start = strip_indent(continuation, content_indent)
             fragments << FragmentLine.new(text: text, ending: continuation.ending,
                                           source_start: source_start, range_start: continuation.start)
+            has_item_content ||= !text.empty?
             paragraph_open = paragraph_continuation?(text)
             item_end = continuation.finish
             index += 1
           elsif paragraph_open && paragraph_continuation?(continuation.text)
             fragments << FragmentLine.new(text: continuation.text, ending: continuation.ending,
                                           source_start: continuation.start, range_start: continuation.start)
+            has_item_content ||= !continuation.text.empty?
             item_end = continuation.finish
             index += 1
           else
@@ -581,11 +589,22 @@ module Beid
     def link_definition_at(index)
       line = @lines[index]
       prefix = LINK_DEFINITION_START.match(line.text)
-      return unless prefix
+      if prefix
+        label = prefix[1]
+        content = prefix[2]
+        content_index = prefix.begin(2)
+        destination_line = index
+      else
+        first_label = /\A {0,3}\[([^\]\n]+)\z/.match(line.text)
+        continuation = @lines[index + 1]
+        continuation_prefix = continuation && /\A {0,3}([^\[\]\n]+)\]:[ \t]*(.*)\z/.match(continuation.text)
+        return unless first_label && continuation_prefix
 
-      content = prefix[2]
-      content_index = prefix.begin(2)
-      destination_line = index
+        label = "#{first_label[1]} #{continuation_prefix[1]}"
+        content = continuation_prefix[2]
+        content_index = continuation_prefix.begin(2)
+        destination_line = index + 1
+      end
       if content.strip.empty?
         destination_line += 1
         return if destination_line >= @lines.length || @lines[destination_line].blank?
@@ -633,7 +652,7 @@ module Beid
       end
 
       {
-        label: prefix[1], destination: destination, title: title,
+        label: label, destination: destination, title: title,
         range: line.start...@lines[last_index].finish,
         destination_range: destination_range, title_range: title_range,
         last_index: last_index
@@ -683,7 +702,7 @@ module Beid
     end
 
     def normalize_reference_label(label)
-      unescape_punctuation(label).gsub(/[[:space:]]+/, " ").strip.downcase(:fold)
+      label.gsub(/[[:space:]]+/, " ").strip.downcase(:fold)
     end
 
     def unescape_punctuation(text)
@@ -691,7 +710,7 @@ module Beid
     end
 
     def list_marker(text, max_indent: 3)
-      match = /\A([ \t]*)([-+*]|(\d{1,9}[.)]))[ \t]+/.match(text)
+      match = /\A([ \t]*)([-+*]|(\d{1,9}[.)]))(?=[ \t]|\z)[ \t]*/.match(text)
       return nil unless match
       indent = indentation(match[1])
       return nil if max_indent && indent > max_indent
