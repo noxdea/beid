@@ -158,6 +158,13 @@ RSpec.describe Beid do
         ["5*6*78\n", [:emphasis]],
         ["*foo*bar\n", [:emphasis]],
         ["**foo**bar\n", [:strong]],
+        ["foo *\\**\n", [:emphasis]],
+        ["foo **\\***\n", [:strong]],
+        ["foo _\\__\n", [:emphasis]],
+        ["foo __\\___\n", [:strong]],
+        ["*foo**\n", [:emphasis]],
+        ["***foo**\n", [:strong]],
+        ["*a `*`*\n", [:emphasis]],
         ["foo_bar_\n", []],
         ["_foo_bar_baz_\n", [:emphasis]],
         ["*(*foo*)*\n", %i[emphasis emphasis]]
@@ -303,6 +310,18 @@ RSpec.describe Beid do
         end
       end
       expect(document.source.byteslice(quote.range)).to eq(source)
+      expect(document.to_s).to eq(source)
+    end
+
+    it "keeps a lazy setext-looking line in a block quote paragraph" do
+      source = "> foo\nbar\n===\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      quote = document.root.children.fetch(0)
+      paragraph = quote.children.fetch(0)
+
+      expect(document.root.children.map(&:type)).to eq([:block_quote])
+      expect(quote.children.map(&:type)).to eq([:paragraph])
+      expect(paragraph.children.map(&:type)).to eq(%i[text softbreak text softbreak text])
       expect(document.to_s).to eq(source)
     end
 

@@ -200,12 +200,16 @@ RSpec.describe "CommonMark 0.31.2 fixture" do
       else
         ""
       end
-      source = document.source.byteslice(node.range)
-      loose = source.match?(/\n[ \t]*\n/)
-      body = node.children.map { |child| render_node(child, document, tight_list: !loose) }.join
+      tight = node.attributes.fetch(:tight, false)
+      body = node.children.map { |child| render_node(child, document, tight_list: tight) }.join
       "<#{tag}#{attrs}>\n#{body}</#{tag}>\n"
     when :list_item
-      body = node.children.map { |child| render_node(child, document, tight_list: tight_list) }.join
+      children = node.children.reject { |child| child.type == :task_checkbox }
+      body = children.each_with_index.map do |child, index|
+        rendered = render_node(child, document, tight_list: tight_list)
+        rendered += " " if tight_list && child.type == :paragraph && index < children.length - 1
+        rendered
+      end.join
       "<li>#{body}</li>\n"
     when :thematic_break
       "<hr />\n"
@@ -233,7 +237,11 @@ RSpec.describe "CommonMark 0.31.2 fixture" do
     when :strikethrough
       "<del>#{children.call}</del>"
     when :link
-      destination = source_attribute(node, :destination_range, document) || node.attributes[:destination]
+      destination = if node.attributes[:autolink]
+        node.attributes[:destination]
+      else
+        source_attribute(node, :destination_range, document) || node.attributes[:destination]
+      end
       title = source_attribute(node, :title_range, document) || node.attributes[:title]
       href = if node.attributes[:autolink]
         uri_escape(destination.to_s)
@@ -246,7 +254,7 @@ RSpec.describe "CommonMark 0.31.2 fixture" do
       label = node.attributes[:label] || source_for(node, document)
       destination = source_attribute(node, :destination_range, document) || node.attributes[:destination]
       title = source_attribute(node, :title_range, document) || node.attributes[:title]
-      attrs = html_attributes("src" => uri_escape(markdown_text(destination.to_s)), "alt" => markdown_text(label),
+      attrs = html_attributes("src" => uri_escape(markdown_text(destination.to_s)), "alt" => image_alt_text(label),
                               "title" => title && markdown_text(title))
       "<img#{attrs} />"
     else
@@ -320,8 +328,15 @@ RSpec.describe "CommonMark 0.31.2 fixture" do
         output << text[index + 1]
         index += 2
       elsif text[index] == "&" && (entity = /\A&(?:#[xX][0-9A-Fa-f]+|#\d+|[A-Za-z][A-Za-z0-9]+);/.match(text[index..]))
-        decoded = Nokogiri::HTML5.fragment(entity[0]).text
-        output << decoded
+        number = /\A&#([xX][0-9A-Fa-f]+|\d+);\z/.match(entity[0])
+        codepoint = if number
+          number[1].match?(/\A[xX]/) ? number[1][1..].to_i(16) : number[1].to_i
+        end
+        if codepoint && codepoint > 0x10ffff
+          output << entity[0]
+        else
+          output << Nokogiri::HTML5.fragment(entity[0]).text
+        end
         index += entity[0].length
       else
         output << text[index]
@@ -329,6 +344,25 @@ RSpec.describe "CommonMark 0.31.2 fixture" do
       end
     end
     output
+  end
+
+  def image_alt_text(label)
+    Beid::InlineParser.new(label, 0, gfm: false).parse.map { |node| image_alt_node(node) }.join
+  end
+
+  def image_alt_node(node)
+    case node.type
+    when :text, :code_span
+      markdown_text(node.attributes.fetch(:text))
+    when :softbreak, :linebreak
+      " "
+    when :image
+      image_alt_text(node.attributes.fetch(:label, ""))
+    when :html_inline
+      ""
+    else
+      node.children.map { |child| image_alt_node(child) }.join
+    end
   end
 
   def escape_text(text)

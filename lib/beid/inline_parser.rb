@@ -4,7 +4,7 @@ module Beid
   class InlineParser
     TOKEN = /(`+)(.+?)\1|(!?)\[([^\]]*)\]\(([^\s()]*(?:\([^()]*\)[^\s()]*)*)(?:[ \t]+(?:"([^"]*)"|'([^']*)'))?\)|(\*\*|__|\*|_|~~)(?=\S)(.+?)\8/m
     AUTOLINK = /<([A-Za-z][A-Za-z0-9.+-]{1,31}:[^ <>]*)>|<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)>/
-    HTML_INLINE = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>|<![A-Z][^>]*>|<\/?[A-Za-z][A-Za-z0-9:.-]*(?:[ \t\n]+(?:[^>\"']|\"[^\"]*\"|'[^']*')*)?[ \t\n]*\/?>/
+    HTML_INLINE = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>|<![A-Z][^>]*>|<\/[A-Za-z][A-Za-z0-9-]*[ \t\n]*>|<[A-Za-z][A-Za-z0-9-]*(?:[ \t\n]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t\n]*=[ \t\n]*(?:[^ \t\n\"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*[ \t\n]*\/?>/
     REFERENCE_START = /!?\[/
     Reference = Struct.new(:start, :finish, :image, :label, :label_start, :label_end,
                            :reference_label, :definition, keyword_init: true)
@@ -51,7 +51,7 @@ module Beid
           inline_link = nil
         end
         if inline_link && code_span && inline_link.start < code_span.start &&
-          code_span.start < inline_link.finish && inline_link.finish < code_span.finish
+          code_span.start <= inline_link.label_finish && inline_link.label_finish < code_span.finish
           inline_link = nil
         end
         if inline_link && html_inline && inline_link.start < html_inline.begin(0) &&
@@ -365,29 +365,70 @@ module Beid
     def find_delimiter_match(match)
       marker = match[8]
       opening_start = match.begin(8)
-      opening_finish = match.end(8)
       return if escaped?(opening_start)
-      return unless can_open_delimiter?(opening_start, marker)
+      opening_length = delimiter_run_length(opening_start, marker[0])
+      opening_marker = marker[0] * opening_length
+      return unless can_open_delimiter?(opening_start, opening_marker)
 
-      search = opening_finish
+      search = opening_start + opening_length
+      ignored = [next_code_span(search), next_html_inline(search)].compact.map do |span|
+        span.respond_to?(:start) ? (span.start...span.finish) : (span.begin(0)...span.end(0))
+      end
       nested_openers = 0
-      while (closing_start = @source.index(marker, search))
+      while (closing_start = @source.index(marker[0], search))
         closing_length = delimiter_run_length(closing_start, marker[0])
-        if closing_length == marker.length && !escaped?(closing_start)
-          can_open = can_open_delimiter?(closing_start, marker)
-          can_close = can_close_delimiter?(closing_start, marker)
+        if ignored.any? { |range| range.cover?(closing_start) }
+          span = ignored.find { |range| range.cover?(closing_start) }
+          search = span.end
+          next
+        end
+        if !escaped?(closing_start)
+          closing_marker = marker[0] * closing_length
+          can_open = can_open_delimiter?(closing_start, closing_marker)
+          can_close = can_close_delimiter?(closing_start, closing_marker)
           if can_open && !can_close
             nested_openers += 1
           elsif can_close && nested_openers.positive?
             nested_openers -= 1
-          elsif can_close && closing_start > opening_finish && !rule_of_three?(opening_start, closing_start, marker)
-            return DelimiterMatch.new(start: opening_start, finish: closing_start + marker.length,
-                                      marker: marker, inner_start: opening_finish, inner_finish: closing_start)
+          elsif can_close && closing_start > opening_start + opening_length - 1 &&
+              !rule_of_three?(opening_start, closing_start, marker[0])
+            match_data = delimiter_pair(opening_start, opening_length, closing_start, closing_length, marker)
+            return match_data if match_data
           end
         end
         search = closing_start + [closing_length, 1].max
       end
       nil
+    end
+
+    def delimiter_pair(opening_start, opening_length, closing_start, closing_length, marker)
+      if marker == "~~"
+        return unless opening_length == 2 && closing_length == 2
+
+        return DelimiterMatch.new(start: opening_start, finish: closing_start + 2,
+                                  marker: marker, inner_start: opening_start + 2,
+                                  inner_finish: closing_start)
+      end
+
+      width = if opening_length >= 2 && closing_length >= 2
+        opening_length.odd? && closing_length.odd? ? 1 : 2
+      elsif opening_length >= 2
+        1
+      else
+        1
+      end
+      start = opening_start
+      if width == 1 && opening_length >= 3 && closing_length >= 2 && closing_length.even?
+        start += 1
+        width = 2
+      end
+      return if opening_length - (start - opening_start) < width || closing_length < width
+
+      close = closing_start
+      close += closing_length - width if width == 1 && opening_length >= 3 && closing_length >= 3
+      tag = marker[0] * width
+      DelimiterMatch.new(start: start, finish: close + width, marker: tag,
+                         inner_start: start + width, inner_finish: close)
     end
 
     def can_open_delimiter?(start, marker)
@@ -429,7 +470,7 @@ module Beid
 
     def delimiter_run_length(start, character)
       finish = start
-      finish += 1 while finish < @source.length && @source[finish] == character
+      finish += 1 while finish < @source.length && @source[finish] == character && !escaped?(finish)
       finish - start
     end
 

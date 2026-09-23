@@ -10,10 +10,11 @@ module Beid
         text.match?(/\A[ \t]*\z/)
       end
     end
-    FragmentLine = Struct.new(:text, :ending, :source_start, :range_start, keyword_init: true)
+    FragmentLine = Struct.new(:text, :ending, :source_start, :range_start, :literal_setext, keyword_init: true)
 
-    def initialize(source, gfm: true, front_matter: true, inherited_link_definitions: {})
+    def initialize(source, gfm: true, front_matter: true, inherited_link_definitions: {}, literal_setext_lines: [])
       @source, @gfm, @front_matter = source, gfm, front_matter
+      @literal_setext_lines = literal_setext_lines
       @lines = source.valid_encoding? ? lines_for(source) : []
       local_definitions, @link_definition_lines = collect_link_definitions
       @link_definitions = inherited_link_definitions.merge(local_definitions).freeze
@@ -72,7 +73,7 @@ module Beid
       line = @lines[index]
       text = line.text
 
-      return parse_fence(index) if (match = /\A {0,3}(`{3,}|~{3,})(.*)\z/.match(text))
+      return parse_fence(index) if fence_opening(text)
       return parse_div(index) if (match = /\A {0,3}:::\s*([^\s]*)\s*\z/.match(text))
       return parse_quote(index) if text.match?(/\A {0,3}>/)
       return [make(:thematic_break, line.start, line.finish, marker: text.strip), index + 1] if thematic_break?(text)
@@ -89,18 +90,27 @@ module Beid
 
     def parse_fence(index)
       opener = @lines[index]
-      match = /\A {0,3}(`{3,}|~{3,})(.*)\z/.match(opener.text)
+      match = fence_opening(opener.text)
       fence, info = match[1], match[2].strip
+      indent = match.begin(1)
       close = (index + 1...@lines.length).find do |i|
         @lines[i].text.match?(/\A {0,3}#{Regexp.escape(fence[0])}{#{fence.length},}[ \t]*\z/)
       end
       last = close ? @lines[close] : @lines[-1]
       finish_index = close ? close + 1 : @lines.length
       content_end = close ? @lines[close].start : @source.bytesize
-      content = @source.byteslice(opener.finish...content_end).to_s
+      content_lines = @lines[(index + 1)...(close || @lines.length)]
+      content = content_lines.map { |line| strip_columns(line.text, indent) + line.ending }.join
       [make(:code_block, opener.start, last.finish, marker: fence,
             attributes: { info: info, fence: fence, closed: !close.nil?,
                           text: content, content_range: opener.finish...content_end }), finish_index]
+    end
+
+    def fence_opening(text)
+      match = /\A {0,3}(`{3,}|~{3,})(.*)\z/.match(text)
+      return if match && match[1].start_with?("`") && match[2].include?("`")
+
+      match
     end
 
     def parse_div(index)
@@ -148,11 +158,12 @@ module Beid
           content_start = line.start + byte_length(line.text[0...prefix_end])
           fragments << FragmentLine.new(text: content, ending: line.ending,
                                         source_start: content_start, range_start: line.start)
-          paragraph_open = paragraph_continuation?(content)
+          paragraph_open = quote_paragraph_open?(content)
           index += 1
-        elsif paragraph_open && paragraph_continuation?(line.text)
+        elsif paragraph_open && !line.blank? && !interrupting?(line.text)
           fragments << FragmentLine.new(text: line.text, ending: line.ending,
-                                        source_start: line.start, range_start: line.start)
+                                        source_start: line.start, range_start: line.start,
+                                        literal_setext: !setext_level(line.text).nil?)
           index += 1
         else
           break
@@ -168,6 +179,8 @@ module Beid
       base_indent, list_marker_text, ordered = initial
       items = []
       while index < @lines.length
+        break if thematic_break?(@lines[index].text)
+
         current = list_marker(@lines[index].text)
         break unless same_list?(current, initial)
 
@@ -175,13 +188,22 @@ module Beid
         marker_match = /\A[ \t]*(?:([-+*])|(\d{1,9}[.)]))(?:([ \t]+)(.*)|\z)/.match(line.text)
         marker = marker_match[1] || marker_match[2]
         content = marker_match[4].to_s
-        content_prefix = line.text[0...(marker_match.begin(4) || line.text.length)]
+        marker_start = marker_match.begin(1) || marker_match.begin(2)
+        marker_finish = marker_start + marker.length
+        marker_indent = indentation(line.text[0...marker_start])
+        spacing = marker_match[3].to_s
+        spacing_columns = indentation(spacing)
+        content_column = marker_indent + marker.length + [spacing_columns, 1].max
+        content_character = marker_match.begin(4)
+        if content_character && spacing_columns > 4
+          content_character = marker_finish + 1
+          content = line.text[content_character..].to_s
+        end
+        content_prefix = line.text[0...(content_character || line.text.length)]
         content_start = line.start + byte_length(content_prefix)
-        content_indent = indentation(content_prefix)
+        content_indent = content_column
         if content.empty?
-          marker_end = marker_match.begin(1) || marker_match.begin(2)
-          marker_end += marker.length
-          content_indent = indentation(line.text[0...marker_end]) + 1
+          content_indent = marker_indent + marker.length + 1
         end
         content_finish = content_start + byte_length(content)
         task = @gfm && /\A\[([ xX])\](?:[ \t]+|$)(.*)\z/.match(content)
@@ -190,7 +212,7 @@ module Beid
           content, content_finish = task[2], content_start + byte_length(task[2])
         end
         attrs = { content_range: content_start...content_finish, ordered: ordered,
-                  start: marker[/\A\d+/]&.to_i, task: !task.nil?, checked: task && task[1].downcase == "x" }
+                  start: marker[/\A\d+/]&.to_i, task: !!task, checked: task && task[1].downcase == "x" }
         fragments = [FragmentLine.new(text: content, ending: line.ending,
                                       source_start: content_start, range_start: content_start)]
         item_end = line.finish
@@ -203,7 +225,7 @@ module Beid
             next_index += 1 while next_index < @lines.length && @lines[next_index].blank?
             next_line = @lines[next_index]
             next_marker = list_marker(next_line&.text.to_s, max_indent: nil)
-            if next_marker && next_marker[0] == base_indent
+            if next_marker && same_list?(initial, next_marker) && next_marker[0] < content_indent
               index = next_index
               break
             end
@@ -234,9 +256,10 @@ module Beid
             paragraph_open = paragraph_continuation?(text)
             item_end = continuation.finish
             index += 1
-          elsif paragraph_open && paragraph_continuation?(continuation.text)
-            fragments << FragmentLine.new(text: continuation.text, ending: continuation.ending,
-                                          source_start: continuation.start, range_start: continuation.start)
+          elsif paragraph_open && continuation_indent < content_indent && !interrupting?(continuation.text)
+            text, source_start = strip_indent(continuation, base_indent)
+            fragments << FragmentLine.new(text: text, ending: continuation.ending,
+                                          source_start: source_start, range_start: continuation.start)
             has_item_content ||= !continuation.text.empty?
             item_end = continuation.finish
             index += 1
@@ -256,7 +279,7 @@ module Beid
       end
       list_type = ordered ? :ordered_list : :list
       [make(list_type, @lines[first].start, items.last.range.end, marker: list_marker_text,
-            attributes: { ordered: ordered, start: initial[3] }, children: items), index]
+            attributes: { ordered: ordered, start: initial[3], tight: !loose_list?(items) }, children: items), index]
     end
 
     def parse_link_definition(index)
@@ -287,8 +310,13 @@ module Beid
 
     def parse_html(index)
       first = index
+      terminator = html_block_terminator(@lines[index].text)
       index += 1
-      index += 1 while index < @lines.length && !@lines[index].blank?
+      if terminator
+        index += 1 while index < @lines.length && !@lines[index - 1].text.match?(terminator)
+      else
+        index += 1 while index < @lines.length && !@lines[index].blank?
+      end
       last = @lines[index - 1]
       [make(:html_block, @lines[first].start, last.finish, marker: nil,
             attributes: { text: @source.byteslice(@lines[first].start...last.finish) }), index]
@@ -373,6 +401,8 @@ module Beid
       line = @lines[index]
       match = /\A {0,3}(\#{1,6})(?:[ \t]+|$)(.*)\z/.match(line.text)
       content = match[2].sub(/[ \t]+#+[ \t]*\z/, "")
+      content = "" if content.match?(/\A#+[ \t]*\z/)
+      content = content.sub(/[ \t]+\z/, "")
       marker_start = line.start + byte_length(line.text[0...match.begin(1)])
       char_offset = match.begin(2)
       start = line.start + byte_length(line.text[0...char_offset])
@@ -387,24 +417,30 @@ module Beid
       first = index
       index += 1
       index += 1 while index < @lines.length && !@lines[index].blank? &&
-        !setext_level(@lines[index].text) && !interrupting?(@lines[index].text)
-      if index < @lines.length && setext_level(@lines[index].text)
+        !setext_underline?(index) && !interrupting?(@lines[index].text)
+      if index < @lines.length && setext_underline?(index)
         last = @lines[index]
         content_line = @lines[index - 1]
         content = @source.byteslice(@lines[first].start...content_line.finish).sub(/(?:\r\n|\r|\n)\z/, "")
-        finish = @lines[first].start + byte_length(content)
+        indentation = content[/\A {0,3}/].to_s
+        content = content.byteslice(indentation.bytesize..).to_s
+        content = content.sub(/[ \t]+\z/, "")
+        start = @lines[first].start + indentation.bytesize
+        finish = start + byte_length(content)
         level = setext_level(last.text)
         marker_start = last.start + byte_length(last.text[/\A */].to_s)
         marker_end = last.start + byte_length(last.text.rstrip)
         node = make(:heading, @lines[first].start, last.finish, marker: last.text.strip,
-                    attributes: { level: level, content_range: @lines[first].start...finish,
+                    attributes: { level: level, content_range: start...finish,
                                   marker_range: marker_start...marker_end, style: :setext },
-                    children: inline_nodes(content, @lines[first].start))
+                    children: inline_nodes(content, start))
         return [node, index + 1]
       end
       last = @lines[index - 1]
       content = @source.byteslice(@lines[first].start...last.finish).sub(/(?:\r\n|\r|\n)\z/, "")
-      start = @lines[first].start
+      indentation = content[/\A {0,3}/].to_s
+      content = content.byteslice(indentation.bytesize..).to_s.sub(/[ \t]+\z/, "")
+      start = @lines[first].start + indentation.bytesize
       [make(:paragraph, start, last.finish,
             attributes: { content_range: start...(start + byte_length(content)) },
             children: inline_nodes(content, start)), index]
@@ -423,8 +459,10 @@ module Beid
       starts = []
       ends = []
       list_starts = {}
+      literal_setext_lines = []
       lines.each do |line|
         offset = source.bytesize
+        literal_setext_lines << offset if line.literal_setext
         starts[offset] = line.source_start
         ends[offset] ||= offset.zero? ? line.source_start : ends[offset - 1]
         list_starts[offset] = line.range_start
@@ -435,7 +473,8 @@ module Beid
       ends[0] ||= starts[0]
 
       parser = self.class.new(source, gfm: @gfm, front_matter: false,
-                              inherited_link_definitions: @link_definitions)
+                              inherited_link_definitions: @link_definitions,
+                              literal_setext_lines: literal_setext_lines)
       root, = parser.parse
       external_range_ids = @link_definitions.values.flat_map do |definition|
         definition.values_at(:range, :destination_range, :title_range)
@@ -491,6 +530,20 @@ module Beid
       !text.match?(/\A[ \t]*\z/) && !text.start_with?("    ", "\t") && !interrupting?(text)
     end
 
+    def quote_paragraph_open?(text)
+      content = text
+      loop do
+        if (quote = /\A {0,3}>(?: ?)(.*)\z/.match(content))
+          content = quote[1]
+        elsif (list = /\A {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)(.*)\z/.match(content))
+          content = list[1]
+        else
+          break
+        end
+      end
+      paragraph_continuation?(content)
+    end
+
     def indented_code_start?(text)
       indentation(text[/\A[ \t]*/].to_s) >= 4
     end
@@ -526,7 +579,7 @@ module Beid
       definitions = {}
       definition_lines = {}
       fence = nil
-      html_block = false
+      html_block = nil
       previous_definition_end = nil
       front_matter_end = if @front_matter && @lines.first&.text == "---"
         (1...@lines.length).find { |index| ["---", "..."].include?(@lines[index].text) }
@@ -544,18 +597,19 @@ module Beid
           next
         end
 
-        if (opening = /\A {0,3}(`{3,}|~{3,})/.match(line.text))
+        if (opening = fence_opening(line.text))
           fence = opening[1]
           index += 1
           next
         end
         if html_block
-          html_block = false if line.blank?
+          html_block = nil if html_block == :blank_line ? line.blank? : line.text.match?(html_block)
           index += 1
           next
         end
         if !directive_comment(line.text) && html_block_start?(line.text)
-          html_block = true
+          terminator = html_block_terminator(line.text)
+          html_block = terminator ? (line.text.match?(terminator) ? nil : terminator) : :blank_line
           index += 1
           next
         end
@@ -697,7 +751,7 @@ module Beid
     end
 
     def link_definition_block_boundary?(text)
-      text.match?(/\A {0,3}(?:\#{1,6}(?:[ \t]|$)|>|`{3,}|~{3,}|(?:[-+*]|\d{1,9}[.)])[ \t]+|(?:[-*_][ \t]*){3,}|<(?!--)|<\/?(?:address|article|aside|blockquote|div|h[1-6]|hr|ol|p|pre|section|table|ul)(?:\s|\x2f?>))/i) ||
+      text.match?(/\A {0,3}(?:\#{1,6}(?:[ \t]|$)|>|`{3,}|~{3,}|(?:[-+*]|\d{1,9}[.)])[ \t]+|(?:[-*_][ \t]*){3,}|<\/?(?:address|article|aside|blockquote|div|h[1-6]|hr|ol|p|pre|section|table|ul)(?:\s|\x2f?>))/i) ||
         text.match?(/\A {0,3}(?:=+|\*{3,}|-{3,})[ \t]*\z/)
     end
 
@@ -719,9 +773,21 @@ module Beid
     end
 
     def same_list?(left, right)
-      return false unless left && left[0] == right[0] && left[2] == right[2]
+      return false unless left && right && left[0] <= 3 && right[0] <= 3 && left[2] == right[2]
 
       left[2] ? left[1][-1] == right[1][-1] : left[1] == right[1]
+    end
+
+    def loose_list?(items)
+      items.each do |item|
+        blocks = item.children.reject { |child| child.type == :task_checkbox }
+        return true if blocks.each_cons(2).any? { |left, right| blank_line_between?(left.range.end, right.range.begin) }
+      end
+      items.each_cons(2).any? { |left, right| blank_line_between?(left.range.end, right.range.begin) }
+    end
+
+    def blank_line_between?(first, last)
+      first < last && @source.byteslice(first...last).to_s.match?(/[\r\n]/)
     end
 
     def indentation(whitespace)
@@ -729,7 +795,7 @@ module Beid
     end
 
     def interrupting?(text)
-      text.match?(/\A {0,3}(?:\#{1,6}(?:[ \t]|$)|>|`{3,}|~{3,}|:::\s*(?:\S|$)|(?:[-+*]|\d{1,9}[.)])[ \t]+|(?:[-*_][ \t]*){3,}|<(?!--)|<\/?(?:address|article|aside|base|blockquote|body|caption|center|col|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|ol|optgroup|option|p|pre|script|section|source|style|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\x2f?>))/i)
+      text.match?(/\A {0,3}(?:\#{1,6}(?:[ \t]|$)|>|`{3,}|~{3,}|:::\s*(?:\S|$)|(?:[-+*]|1[.)])[ \t]+|(?:[-*_][ \t]*){3,}|<\/?(?:address|article|aside|base|blockquote|body|caption|center|col|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|ol|optgroup|option|p|pre|script|section|source|style|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\x2f?>))/i)
     end
 
     def thematic_break?(text)
@@ -743,13 +809,34 @@ module Beid
       nil
     end
 
+    def setext_underline?(index)
+      !@literal_setext_lines.include?(@lines[index].start) && !setext_level(@lines[index].text).nil?
+    end
+
     def table_separator?(text)
       text && text.include?("|") && table_cells(Line.new(text: text)).all? { |cell| cell[:text].strip.match?(/\A:?-{3,}:?\z/) }
     end
 
     def html_block_start?(text)
-      text.match?(/\A {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z]|<\/?(?:address|article|aside|base|blockquote|body|caption|center|col|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|ol|optgroup|option|p|pre|script|section|source|style|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\x2f?>))/i) ||
-        text.match?(/\A {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[^<>]*?)?\/?>(?:[ \t]*)\z/)
+      text.match?(/\A {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z]|<(?:script|pre|style|textarea)(?:[ \t]|$)|<\/?(?:address|article|aside|base|blockquote|body|caption|center|col|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|ol|optgroup|option|p|pre|script|section|source|style|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\x2f?>))/i) ||
+        valid_html_tag_line?(text)
+    end
+
+    def valid_html_tag_line?(text)
+      line = text.sub(/\A {0,3}/, "")
+      match = InlineParser::HTML_INLINE.match(line)
+      match && match.begin(0).zero? && match.end(0) == line.rstrip.length
+    end
+
+    def html_block_terminator(text)
+      tag = /\A {0,3}<(script|pre|style|textarea)(?=[ \t\n>]|$)/i.match(text)
+      return %r{</#{Regexp.escape(tag[1])}[ \t]*>}i if tag
+      return /-->/ if text.match?(/\A {0,3}<!--/)
+      return /\?>/ if text.match?(/\A {0,3}<\?/)
+      return /\]\]>/ if text.match?(/\A {0,3}<!\[CDATA\[/)
+      return />/ if text.match?(/\A {0,3}<![A-Z]/)
+
+      nil
     end
 
     def directive_comment(text)
