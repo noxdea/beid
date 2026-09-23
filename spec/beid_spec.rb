@@ -152,6 +152,9 @@ RSpec.describe Beid do
         ["a * foo bar*\n", []],
         ["a*\"foo\"*\n", []],
         ["foo*bar*\n", [:emphasis]],
+        ["5*6*78\n", [:emphasis]],
+        ["*foo*bar\n", [:emphasis]],
+        ["**foo**bar\n", [:strong]],
         ["foo_bar_\n", []],
         ["_foo_bar_baz_\n", [:emphasis]],
         ["*(*foo*)*\n", %i[emphasis emphasis]]
