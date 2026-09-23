@@ -380,7 +380,7 @@ module Beid
             nested_openers += 1
           elsif can_close && nested_openers.positive?
             nested_openers -= 1
-          elsif can_close && !rule_of_three?(opening_start, closing_start, marker)
+          elsif can_close && closing_start > opening_finish && !rule_of_three?(opening_start, closing_start, marker)
             return DelimiterMatch.new(start: opening_start, finish: closing_start + marker.length,
                                       marker: marker, inner_start: opening_finish, inner_finish: closing_start)
           end
