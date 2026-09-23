@@ -25,6 +25,16 @@ RSpec.describe Beid do
       end
     end
 
+    it "keeps unsupported custom HTML blocks as raw source nodes" do
+      source = "<x-card data-kind='demo'>\n*unparsed* content\n</x-card>\n\nAfter.\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      raw_block = document.root.children.first
+
+      expect(raw_block.type).to eq(:html_block)
+      expect(raw_block.attributes[:text]).to eq("<x-card data-kind='demo'>\n*unparsed* content\n</x-card>\n")
+      expect(document.to_s).to eq(source)
+    end
+
     it "parses block and inline nodes with byte ranges" do
       source = "# 見出し *強調*\n\nA [link](https://example.test) and `code`.\n\n- first\n- second\n\n> quote\n\n```rb\nx\n```\n\n***\n"
       document = described_class.parse(source)

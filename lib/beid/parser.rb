@@ -366,7 +366,8 @@ module Beid
     end
 
     def html_block_start?(text)
-      text.match?(/\A {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z]|<\/?(?:address|article|aside|base|blockquote|body|caption|center|col|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|ol|optgroup|option|p|pre|script|section|source|style|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\x2f?>))/i)
+      text.match?(/\A {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z]|<\/?(?:address|article|aside|base|blockquote|body|caption|center|col|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|ol|optgroup|option|p|pre|script|section|source|style|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\x2f?>))/i) ||
+        text.match?(/\A {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[^<>]*?)?\/?>(?:[ \t]*)\z/)
     end
 
     def directive_comment(text)
