@@ -132,6 +132,67 @@ RSpec.describe Beid do
       expect(document.to_s).to eq(source)
     end
 
+    it "parses list-item continuation paragraphs into source-nested blocks" do
+      source = "- a\n  continuation\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      list = document.root.children.fetch(0)
+      item = list.children.fetch(0)
+      paragraph = item.children.fetch(0)
+      text = paragraph.children.fetch(0)
+
+      expect(list.type).to eq(:list)
+      expect(item.type).to eq(:list_item)
+      expect(item.children.map(&:type)).to eq([:paragraph])
+      expect(text.attributes[:text]).to eq("a\ncontinuation")
+      expect(item.range.begin).to be <= paragraph.range.begin
+      expect(paragraph.range.end).to be <= item.range.end
+      expect(paragraph.range.begin).to be <= text.range.begin
+      expect(text.range.end).to be <= paragraph.range.end
+      expect(document.source.byteslice(item.range)).to eq(source)
+      expect(document.to_s).to eq(source)
+    end
+
+    it "keeps multiple indented blocks inside one list item" do
+      source = "- a\n  continuation\n\n  > quoted\n  >\n  > body\n\n  ```rb\n  puts :ok\n  ```\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      item = document.root.children.fetch(0).children.fetch(0)
+
+      expect(item.children.map(&:type)).to eq(%i[paragraph block_quote code_block])
+      expect(item.children[0].children.first.attributes[:text]).to eq("a\ncontinuation")
+      expect(item.children[1].children.map(&:type)).to eq(%i[paragraph paragraph])
+      expect(item.children[1].children.map { |node| node.children.first.attributes[:text] }).to eq(["quoted", "body"])
+      expect(item.children[2].attributes[:info]).to eq("rb")
+      expect(item.children.all? do |node|
+        item.range.begin <= node.range.begin && node.range.end <= item.range.end
+      end).to be(true)
+      expect(document.source.byteslice(item.range)).to eq(source)
+      expect(document.to_s).to eq(source)
+    end
+
+    it "parses block quote headings and lazy paragraph continuations" do
+      source = "> # Foo\n> bar\nbaz\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      quote = document.root.children.fetch(0)
+      heading, paragraph = quote.children
+
+      expect(quote.type).to eq(:block_quote)
+      expect(heading.type).to eq(:heading)
+      expect(heading.attributes[:level]).to eq(1)
+      expect(heading.children.map { |node| node.attributes[:text] }.join).to eq("Foo")
+      expect(paragraph.type).to eq(:paragraph)
+      expect(paragraph.children.map { |node| node.attributes[:text] }.join).to eq("bar\nbaz")
+      [heading, paragraph].each do |child|
+        expect(quote.range.begin).to be <= child.range.begin
+        expect(child.range.end).to be <= quote.range.end
+        child.children.each do |inline|
+          expect(child.range.begin).to be <= inline.range.begin
+          expect(inline.range.end).to be <= child.range.end
+        end
+      end
+      expect(document.source.byteslice(quote.range)).to eq(source)
+      expect(document.to_s).to eq(source)
+    end
+
     it "uses the first reference definition and ignores definitions inside code fences" do
       source = "[item][key]\n\n[key]: /first\n[key]: /second\n\n```\n[hidden]: /code\n```\n\n[hidden]\n"
       document = described_class.parse(source, gfm: false, front_matter: false)

@@ -10,11 +10,13 @@ module Beid
         text.match?(/\A[ \t]*\z/)
       end
     end
+    FragmentLine = Struct.new(:text, :ending, :source_start, :range_start, keyword_init: true)
 
-    def initialize(source, gfm: true, front_matter: true)
+    def initialize(source, gfm: true, front_matter: true, inherited_link_definitions: {})
       @source, @gfm, @front_matter = source, gfm, front_matter
       @lines = source.valid_encoding? ? lines_for(source) : []
-      @link_definitions, @link_definition_lines = collect_link_definitions
+      local_definitions, @link_definition_lines = collect_link_definitions
+      @link_definitions = inherited_link_definitions.merge(local_definitions).freeze
     end
 
     def parse
@@ -133,35 +135,47 @@ module Beid
 
     def parse_quote(index)
       first = index
-      index += 1
-      index += 1 while index < @lines.length && @lines[index].text.match?(/\A {0,3}>/)
-      last = @lines[index - 1]
-      children = []
-      @lines[first...index].each do |line|
+      fragments = []
+      paragraph_open = false
+      while index < @lines.length
+        line = @lines[index]
         match = /\A {0,3}> ?(.*)\z/.match(line.text)
-        next unless match
-
-        start = line.start + byte_length(line.text[0...match.begin(1)])
-        finish = start + byte_length(match[1])
-        children.concat(inline_nodes(match[1], start))
+        if match
+          prefix_end = match.begin(1)
+          content = match[1]
+          content_start = line.start + byte_length(line.text[0...prefix_end])
+          fragments << FragmentLine.new(text: content, ending: line.ending,
+                                        source_start: content_start, range_start: line.start)
+          paragraph_open = paragraph_continuation?(content)
+          index += 1
+        elsif paragraph_open && paragraph_continuation?(line.text)
+          fragments << FragmentLine.new(text: line.text, ending: line.ending,
+                                        source_start: line.start, range_start: line.start)
+          index += 1
+        else
+          break
+        end
       end
-      [make(:block_quote, @lines[first].start, last.finish, marker: ">", children: children), index]
+      children = parse_fragment(fragments)
+      [make(:block_quote, @lines[first].start, @lines[index - 1].finish, marker: ">", children: children), index]
     end
 
-    def parse_list(index, nested: false)
+    def parse_list(index)
       first = index
-      initial = list_marker(@lines[index].text, max_indent: nested ? nil : 3)
+      initial = list_marker(@lines[index].text)
       base_indent, list_marker_text, ordered = initial
       items = []
       while index < @lines.length
-        current = list_marker(@lines[index].text, max_indent: nested ? nil : 3)
+        current = list_marker(@lines[index].text)
         break unless same_list?(current, initial)
 
         line = @lines[index]
         marker_match = /\A[ \t]*(?:([-+*])|(\d{1,9}[.)]))[ \t]+(.*)\z/.match(line.text)
         marker = marker_match[1] || marker_match[2]
         content = marker_match[3]
-        content_start = line.start + byte_length(line.text[0...marker_match.begin(3)])
+        content_prefix = line.text[0...marker_match.begin(3)]
+        content_start = line.start + byte_length(content_prefix)
+        content_indent = indentation(content_prefix)
         content_finish = content_start + byte_length(content)
         task = @gfm && /\A\[([ xX])\](?:[ \t]+|$)(.*)\z/.match(content)
         if task
@@ -170,39 +184,63 @@ module Beid
         end
         attrs = { content_range: content_start...content_finish, ordered: ordered,
                   start: marker[/\A\d+/]&.to_i, task: !task.nil?, checked: task && task[1].downcase == "x" }
-        item_children = inline_nodes(content, content_start)
-        item_children.unshift(Node.new(type: :task_checkbox,
-                                       attributes: { checked: attrs[:checked] }, children: [],
-                                       range: (content_start - (task[0].bytesize - task[2].bytesize))...content_start,
-                                       marker: task[1])) if task
+        fragments = [FragmentLine.new(text: content, ending: line.ending,
+                                      source_start: content_start, range_start: content_start)]
         item_end = line.finish
+        paragraph_open = paragraph_continuation?(content)
         index += 1
         while index < @lines.length
           if @lines[index].blank?
             next_index = index + 1
             next_index += 1 while next_index < @lines.length && @lines[next_index].blank?
-            marker_after_blank = list_marker(@lines[next_index]&.text.to_s, max_indent: nil)
-            if marker_after_blank && marker_after_blank[0] > base_indent
+            next_line = @lines[next_index]
+            next_marker = list_marker(next_line&.text.to_s, max_indent: nil)
+            if next_marker && next_marker[0] == base_indent
               index = next_index
-              child_list, index = parse_list(index, nested: true)
-              item_children << child_list
-              item_end = child_list.range.end
+              break
+            end
+            if next_line && indentation(next_line.text[/\A[ \t]*/].to_s) >= content_indent
+              while index < next_index
+                blank = @lines[index]
+                blank_text, blank_start = strip_indent(blank, content_indent)
+                fragments << FragmentLine.new(text: blank_text, ending: blank.ending,
+                                              source_start: blank_start, range_start: blank.start)
+                item_end = blank.finish
+                index += 1
+              end
               next
             end
             break
           end
 
-          child_marker = list_marker(@lines[index].text, max_indent: nil)
-          if child_marker && child_marker[0] > base_indent
-            child_list, index = parse_list(index, nested: true)
-            item_children << child_list
-            item_end = child_list.range.end
-          elsif continuation_line?(@lines[index], base_indent)
-            item_end = @lines[index].finish
+          continuation = @lines[index]
+          continuation_marker = list_marker(continuation.text, max_indent: nil)
+          continuation_indent = indentation(continuation.text[/\A[ \t]*/].to_s)
+          break if continuation_marker && continuation_marker[0] == base_indent
+
+          if continuation_indent >= content_indent
+            text, source_start = strip_indent(continuation, content_indent)
+            fragments << FragmentLine.new(text: text, ending: continuation.ending,
+                                          source_start: source_start, range_start: continuation.start)
+            paragraph_open = paragraph_continuation?(text)
+            item_end = continuation.finish
+            index += 1
+          elsif paragraph_open && paragraph_continuation?(continuation.text)
+            fragments << FragmentLine.new(text: continuation.text, ending: continuation.ending,
+                                          source_start: continuation.start, range_start: continuation.start)
+            item_end = continuation.finish
             index += 1
           else
             break
           end
+        end
+
+        item_children = parse_fragment(fragments, preserve_list_indent: true)
+        if task
+          checkbox_start = content_start - (task[0].bytesize - task[2].bytesize)
+          item_children.unshift(Node.new(type: :task_checkbox,
+                                         attributes: { checked: attrs[:checked] }, children: [],
+                                         range: checkbox_start...content_start, marker: task[1]))
         end
         items << make(:list_item, line.start, item_end, marker: marker, attributes: attrs, children: item_children)
       end
@@ -366,6 +404,89 @@ module Beid
 
     def inline_nodes(text, offset)
       InlineParser.new(text, offset, gfm: @gfm, references: @link_definitions).parse
+    end
+
+    def parse_fragment(lines, preserve_list_indent: false)
+      source = +""
+      starts = []
+      ends = []
+      list_starts = {}
+      lines.each do |line|
+        offset = source.bytesize
+        starts[offset] = line.source_start
+        ends[offset] ||= offset.zero? ? line.source_start : ends[offset - 1]
+        list_starts[offset] = line.range_start
+        append_fragment_text(source, line.text, line.source_start, starts, ends)
+        append_fragment_text(source, line.ending, line.source_start + line.text.bytesize, starts, ends)
+      end
+      starts[0] ||= lines.first&.source_start || 0
+      ends[0] ||= starts[0]
+
+      parser = self.class.new(source, gfm: @gfm, front_matter: false,
+                              inherited_link_definitions: @link_definitions)
+      root, = parser.parse
+      external_range_ids = @link_definitions.values.flat_map do |definition|
+        definition.values_at(:range, :destination_range, :title_range)
+      end.compact.map(&:object_id)
+      root.children.map do |node|
+        remap_fragment_node(node, starts, ends, list_starts, external_range_ids, preserve_list_indent)
+      end
+    end
+
+    def append_fragment_text(source, text, source_start, starts, ends)
+      offset = source.bytesize
+      starts[offset] ||= source_start
+      ends[offset] ||= source_start
+      source << text
+      (1..text.bytesize).each do |length|
+        starts[offset + length] = source_start + length
+        ends[offset + length] = source_start + length
+      end
+    end
+
+    def remap_fragment_node(node, starts, ends, list_starts, external_range_ids, preserve_list_indent)
+      children = node.children.map do |child|
+        remap_fragment_node(child, starts, ends, list_starts, external_range_ids, preserve_list_indent)
+      end
+      range = remap_fragment_range(node.range, starts, ends)
+      if preserve_list_indent && %i[list ordered_list].include?(node.type) && list_starts.key?(node.range.begin)
+        range = list_starts.fetch(node.range.begin)...range.end
+      end
+      attributes = remap_fragment_value(node.attributes, starts, ends, external_range_ids)
+      Node.new(type: node.type, attributes: attributes, children: children, range: range, marker: node.marker)
+    end
+
+    def remap_fragment_value(value, starts, ends, external_range_ids)
+      case value
+      when Range
+        external_range_ids.include?(value.object_id) ? value : remap_fragment_range(value, starts, ends)
+      when Array
+        value.map { |item| remap_fragment_value(item, starts, ends, external_range_ids) }
+      when Hash
+        value.to_h do |key, item|
+          [key, remap_fragment_value(item, starts, ends, external_range_ids)]
+        end
+      else
+        value
+      end
+    end
+
+    def remap_fragment_range(range, starts, ends)
+      (starts[range.begin] || range.begin)...(ends[range.end] || range.end)
+    end
+
+    def paragraph_continuation?(text)
+      !text.match?(/\A[ \t]*\z/) && !text.start_with?("    ", "\t") && !interrupting?(text)
+    end
+
+    def strip_indent(line, columns)
+      index = 0
+      column = 0
+      while index < line.text.length && column < columns && line.text[index].match?(/[ \t]/)
+        column = line.text[index] == "\t" ? (column / 4 + 1) * 4 : column + 1
+        index += 1
+      end
+      [line.text[index..].to_s, line.start + byte_length(line.text[0...index])]
     end
 
     def collect_link_definitions
@@ -557,15 +678,6 @@ module Beid
       return false unless left && left[0] == right[0] && left[2] == right[2]
 
       left[2] ? left[1][-1] == right[1][-1] : left[1] == right[1]
-    end
-
-    def continuation_line?(line, indent)
-      return false if line.blank?
-      marker = list_marker(line.text, max_indent: nil)
-      return marker && marker[0] > indent if marker
-
-      whitespace = line.text[/\A[ \t]*/].to_s
-      indentation(whitespace) >= indent + 2 && line.text.length > whitespace.length
     end
 
     def indentation(whitespace)
