@@ -4,11 +4,14 @@ module Beid
   class InlineParser
     TOKEN = /(`+)(.+?)\1|(!?)\[([^\]]*)\]\(([^\s()]*(?:\([^()]*\)[^\s()]*)*)(?:[ \t]+(?:"([^"]*)"|'([^']*)'))?\)|(\*\*|__|\*|_|~~)(?=\S)(.+?)\8(?![\p{Word}])/m
     AUTOLINK = /<([A-Za-z][A-Za-z0-9.+-]{1,31}:[^ <>]*)>|<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)>/
+    HTML_INLINE = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>|<![A-Z][^>]*>|<\/?[A-Za-z][A-Za-z0-9:.-]*(?:[ \t\n]+(?:[^>\"']|\"[^\"]*\"|'[^']*')*)?[ \t\n]*\/?>/
     REFERENCE_START = /!?\[/
     Reference = Struct.new(:start, :finish, :image, :label, :label_start, :label_end,
                            :reference_label, :definition, keyword_init: true)
     CodeRun = Struct.new(:start, :finish, :length, keyword_init: true)
     CodeSpan = Struct.new(:start, :finish, :marker, :text, keyword_init: true)
+    Break = Struct.new(:start, :finish, :type, :marker, keyword_init: true)
+    DelimiterMatch = Struct.new(:start, :finish, :marker, :inner_start, :inner_finish, keyword_init: true)
 
     def initialize(source, base_offset, gfm: true, references: {})
       @source, @base_offset, @gfm, @references = source, base_offset, gfm, references
@@ -29,18 +32,26 @@ module Beid
       while cursor < @source.length
         match = next_inline_match(cursor)
         code_span = next_code_span(cursor)
+        line_break = next_line_break(cursor)
+        html_inline = next_html_inline(cursor)
         footnote = /\[\^([^\]]+)\]/.match(@source, cursor) if @gfm
-        autolink = AUTOLINK.match(@source, cursor)
-        if match && autolink && ((match[3] && autolink.begin(0) < match.end(0) && autolink.end(0) > match.end(0)) ||
+        autolink = next_autolink(cursor)
+        if match.is_a?(MatchData) && autolink && ((match[3] && autolink.begin(0) < match.end(0) && autolink.end(0) > match.end(0)) ||
           (match[8] && autolink.begin(0) <= match.end(9) && match.end(9) < autolink.end(0)))
+          match = nil
+        elsif match.is_a?(DelimiterMatch) && autolink &&
+          autolink.begin(0) <= match.inner_finish && match.inner_finish < autolink.end(0)
           match = nil
         end
         reference = next_reference(cursor)
-        if match && match[8] && reference && match.begin(0) < reference.start &&
+        if match.is_a?(MatchData) && match[8] && reference && match.begin(0) < reference.start &&
           match.end(9) > reference.start && match.end(9) < reference.finish
           match = nil
+        elsif match.is_a?(DelimiterMatch) && reference && match.start < reference.start &&
+          match.inner_finish > reference.start && match.inner_finish < reference.finish
+          match = nil
         end
-        candidates = [[:inline, match], [:code, code_span], [:footnote, footnote],
+        candidates = [[:inline, match], [:code, code_span], [:break, line_break], [:html, html_inline], [:footnote, footnote],
                       [:autolink, autolink], [:reference, reference]]
           .compact.reject { |_kind, candidate| candidate.nil? }
         kind, candidate = candidates.min_by { |candidate_kind, value| [candidate_start(candidate_kind, value), candidate_priority(candidate_kind)] }
@@ -56,8 +67,26 @@ module Beid
           match = candidate
           nodes << node(:footnote_reference, cursor, match.end(0), "[^",
                         { identifier: match[1] })
+        elsif kind == :break
+          nodes << node(candidate.type, candidate.start, candidate.finish, candidate.marker)
+        elsif kind == :html
+          nodes << node(:html_inline, candidate.begin(0), candidate.end(0), nil, text: candidate[0])
         elsif kind == :code
           nodes << node(:code_span, cursor, candidate.finish, candidate.marker, text: candidate.text)
+        elsif candidate.is_a?(DelimiterMatch)
+          body = @source[candidate.inner_start...candidate.inner_finish]
+          type = case candidate.marker
+          when "**", "__" then :strong
+          when "~~" then @gfm ? :strikethrough : nil
+          else :emphasis
+          end
+          if type
+            children = InlineParser.new(body, @base_offset + byte_offset(candidate.inner_start),
+                                        gfm: @gfm, references: @references).parse
+            nodes << node(type, candidate.start, candidate.finish, candidate.marker, { text: body }, children)
+          else
+            nodes << text_node(candidate.start, candidate.finish)
+          end
         elsif kind == :autolink
           nodes << parse_autolink(candidate)
         elsif kind == :reference
@@ -65,12 +94,20 @@ module Beid
         elsif match[3]
           match = candidate
           image = match[3] == "!"
-          label, destination, title = match[4], match[5], match[6] || match[7]
+          label = match[4]
+          destination = unescape_punctuation(match[5])
+          title = unescape_punctuation(match[6] || match[7])
+          title_range = if match[6]
+            range_for_capture(6, match)
+          elsif match[7]
+            range_for_capture(7, match)
+          end
           type = image ? :image : :link
           children = image ? [] : InlineParser.new(label, @base_offset + byte_offset(cursor) + 1, gfm: @gfm).parse
           nodes << node(type, cursor, match.end(0), image ? "![" : "[", {
             label: label, destination: destination, title: title,
             destination_range: range_for_capture(5, match),
+            title_range: title_range,
             label_range: range_for_capture(4, match)
           }, children)
         else
@@ -91,7 +128,7 @@ module Beid
             nodes << text_node(cursor, next_cursor)
           end
         end
-        cursor = %i[reference code].include?(kind) ? candidate.finish : candidate.end(0)
+        cursor = %i[reference code break].include?(kind) || candidate.is_a?(DelimiterMatch) ? candidate.finish : candidate.end(0)
       end
       nodes
     end
@@ -99,21 +136,150 @@ module Beid
     private
 
     def candidate_start(kind, candidate)
-      %i[reference code].include?(kind) ? candidate.start : candidate.begin(0)
+      return candidate.start if %i[reference code break].include?(kind) || candidate.is_a?(DelimiterMatch)
+
+      candidate.begin(0)
     end
 
     def candidate_priority(kind)
-      { inline: 0, code: 1, footnote: 2, autolink: 3, reference: 4 }.fetch(kind)
+      { inline: 0, code: 1, break: 2, html: 3, footnote: 4, autolink: 5, reference: 6 }.fetch(kind)
     end
 
     def next_inline_match(cursor)
       match = TOKEN.match(@source, cursor)
-      while match && match[1]
-        next_start = match.begin(1)
-        next_start += 1 while next_start < @source.length && @source[next_start] == "`"
-        match = TOKEN.match(@source, next_start)
+      while match
+        if match[1]
+          next_start = match.begin(1)
+          next_start += 1 while next_start < @source.length && @source[next_start] == "`"
+          match = TOKEN.match(@source, next_start)
+        elsif match[8]
+          delimiter_match = find_delimiter_match(match)
+          return delimiter_match if delimiter_match
+
+          match = TOKEN.match(@source, match.begin(8) + match[8].length)
+        elsif escaped?(match.begin(0))
+          match = TOKEN.match(@source, match.end(0))
+        else
+          break
+        end
       end
       match
+    end
+
+    def find_delimiter_match(match)
+      marker = match[8]
+      opening_start = match.begin(8)
+      opening_finish = match.end(8)
+      return if escaped?(opening_start)
+      return unless can_open_delimiter?(opening_start, marker)
+
+      search = opening_finish
+      nested_openers = 0
+      while (closing_start = @source.index(marker, search))
+        closing_length = delimiter_run_length(closing_start, marker[0])
+        if closing_length == marker.length && !escaped?(closing_start)
+          can_open = can_open_delimiter?(closing_start, marker)
+          can_close = can_close_delimiter?(closing_start, marker)
+          if can_open && !can_close
+            nested_openers += 1
+          elsif can_close && nested_openers.positive?
+            nested_openers -= 1
+          elsif can_close && !rule_of_three?(opening_start, closing_start, marker)
+            return DelimiterMatch.new(start: opening_start, finish: closing_start + marker.length,
+                                      marker: marker, inner_start: opening_finish, inner_finish: closing_start)
+          end
+        end
+        search = closing_start + [closing_length, 1].max
+      end
+      nil
+    end
+
+    def can_open_delimiter?(start, marker)
+      before = start.positive? ? @source[start - 1] : nil
+      after = @source[start + marker.length]
+      left, right = flanking?(before, after)
+      left && (marker[0] != "_" || !right || punctuation?(before))
+    end
+
+    def can_close_delimiter?(start, marker)
+      before = start.positive? ? @source[start - 1] : nil
+      after = @source[start + marker.length]
+      left, right = flanking?(before, after)
+      right && (marker[0] != "_" || !left || punctuation?(after))
+    end
+
+    def flanking?(before, after)
+      before_space = before.nil? || before.match?(/\p{Space}/)
+      after_space = after.nil? || after.match?(/\p{Space}/)
+      before_punctuation = punctuation?(before)
+      after_punctuation = punctuation?(after)
+      left = !after_space && (!after_punctuation || before_space || before_punctuation)
+      right = !before_space && (!before_punctuation || after_space || after_punctuation)
+      [left, right]
+    end
+
+    def punctuation?(character)
+      character && character.match?(/[\p{P}\p{S}]/)
+    end
+
+    def rule_of_three?(opening_start, closing_start, marker)
+      opening_length = delimiter_run_length(opening_start, marker[0])
+      closing_length = delimiter_run_length(closing_start, marker[0])
+      opening_can_close = can_close_delimiter?(opening_start, marker[0] * opening_length)
+      closing_can_open = can_open_delimiter?(closing_start, marker[0] * closing_length)
+      (opening_can_close || closing_can_open) && ((opening_length + closing_length) % 3).zero? &&
+        (opening_length % 3 != 0 || closing_length % 3 != 0)
+    end
+
+    def delimiter_run_length(start, character)
+      finish = start
+      finish += 1 while finish < @source.length && @source[finish] == character
+      finish - start
+    end
+
+    def next_autolink(cursor)
+      match = AUTOLINK.match(@source, cursor)
+      while match && escaped?(match.begin(0))
+        match = AUTOLINK.match(@source, match.end(0))
+      end
+      match
+    end
+
+    def next_html_inline(cursor)
+      match = HTML_INLINE.match(@source, cursor)
+      while match && escaped?(match.begin(0))
+        match = HTML_INLINE.match(@source, match.end(0))
+      end
+      match
+    end
+
+    def next_line_break(cursor)
+      search = cursor
+      while (newline = /\r\n|\r|\n/.match(@source, search))
+        newline_start = newline.begin(0)
+        slash_count = 0
+        slash_index = newline_start - 1
+        while slash_index >= cursor && @source[slash_index] == "\\"
+          slash_count += 1
+          slash_index -= 1
+        end
+        if slash_count.odd?
+          start = newline_start - 1
+          marker = "\\"
+          type = :linebreak
+        else
+          space_index = newline_start - 1
+          space_index -= 1 while space_index >= cursor && @source[space_index].match?(/[ \t]/)
+          spaces = newline_start - space_index - 1
+          start = spaces >= 2 ? newline_start - spaces : newline_start
+          marker = spaces >= 2 ? @source[start...newline_start] : nil
+          type = spaces >= 2 ? :linebreak : :softbreak
+        end
+        return Break.new(start: start, finish: newline.end(0), type: type, marker: marker) if start >= cursor
+
+        search = newline.end(0)
+      end
+      nil
     end
 
     def next_code_span(cursor)
@@ -153,7 +319,7 @@ module Beid
       first, last = match.begin(0), match.end(0)
       label_first, label_last = match.begin(0) + 1, match.end(0) - 1
       destination = match[2] ? "mailto:#{label}" : label
-      child = node(:text, label_first, label_last, nil, text: label)
+      child = node(:text, label_first, label_last, nil, text: label, literal: true)
       node(:link, first, last, "<", {
         label: label, destination: destination, title: nil, autolink: true,
         destination_range: range_for_offsets(label_first, label_last)
@@ -266,8 +432,13 @@ module Beid
       label.gsub(/\\([[:punct:]])/, "\\1").gsub(/[[:space:]]+/, " ").strip.downcase(:fold)
     end
 
+    def unescape_punctuation(text)
+      text&.gsub(/\\([[:punct:]])/, "\\1")
+    end
+
     def text_node(first, last)
-      node(:text, first, last, nil, text: @source[first...last])
+      text = unescape_punctuation(@source[first...last])
+      node(:text, first, last, nil, text: text)
     end
 
     def node(type, first, last, marker, attributes = {}, children = [])

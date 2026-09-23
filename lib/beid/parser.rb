@@ -75,16 +75,15 @@ module Beid
       return parse_fence(index) if (match = /\A {0,3}(`{3,}|~{3,})(.*)\z/.match(text))
       return parse_div(index) if (match = /\A {0,3}:::\s*([^\s]*)\s*\z/.match(text))
       return parse_quote(index) if text.match?(/\A {0,3}>/)
+      return [make(:thematic_break, line.start, line.finish, marker: text.strip), index + 1] if thematic_break?(text)
       return parse_list(index) if list_marker(text)
-      return parse_indented_code(index) if text.start_with?("    ", "\t")
+      return parse_indented_code(index) if indented_code_start?(text)
       return [parse_comment_directive(index), index + 1] if directive_comment(text)
       return parse_html(index) if html_block_start?(text)
       return parse_link_definition(index) if @link_definition_lines.key?(index)
       return parse_table(index) if @gfm && table_separator?(@lines[index + 1]&.text) && text.include?("|")
       return parse_footnote(index) if @gfm && text.match?(/\A {0,3}\[\^[^\]]+\]:/)
       return [parse_heading(index), index + 1] if (match = /\A {0,3}(\#{1,6})(?:[ \t]+|$)(.*)\z/.match(text))
-      return [make(:thematic_break, line.start, line.finish, marker: text.strip), index + 1] if thematic_break?(text)
-
       parse_paragraph(index)
     end
 
@@ -97,8 +96,11 @@ module Beid
       end
       last = close ? @lines[close] : @lines[-1]
       finish_index = close ? close + 1 : @lines.length
+      content_end = close ? @lines[close].start : @source.bytesize
+      content = @source.byteslice(opener.finish...content_end).to_s
       [make(:code_block, opener.start, last.finish, marker: fence,
-            attributes: { info: info, fence: fence, closed: !close.nil? }), finish_index]
+            attributes: { info: info, fence: fence, closed: !close.nil?,
+                          text: content, content_range: opener.finish...content_end }), finish_index]
     end
 
     def parse_div(index)
@@ -267,10 +269,12 @@ module Beid
     def parse_indented_code(index)
       first = index
       index += 1
-      index += 1 while index < @lines.length && (@lines[index].text.start_with?("    ", "\t") || @lines[index].blank?)
+      index += 1 while index < @lines.length && (indented_code_start?(@lines[index].text) || @lines[index].blank?)
       index -= 1 while index > first && @lines[index - 1].blank?
       last = @lines[index - 1]
-      [make(:code_block, @lines[first].start, last.finish, marker: "    ", attributes: { info: "", fence: nil }), index]
+      content = @lines[first...index].map { |line| strip_columns(line.text, 4) + line.ending }.join
+      [make(:code_block, @lines[first].start, last.finish, marker: "    ",
+            attributes: { info: "", fence: nil, text: content }), index]
     end
 
     def parse_html(index)
@@ -479,6 +483,27 @@ module Beid
       !text.match?(/\A[ \t]*\z/) && !text.start_with?("    ", "\t") && !interrupting?(text)
     end
 
+    def indented_code_start?(text)
+      indentation(text[/\A[ \t]*/].to_s) >= 4
+    end
+
+    def strip_columns(text, columns)
+      index = 0
+      column = 0
+      while index < text.length && column < columns && text[index].match?(/[ \t]/)
+        if text[index] == "\t"
+          next_column = (column / 4 + 1) * 4
+          return (" " * (next_column - columns)) + text[(index + 1)..].to_s if next_column > columns
+
+          column = next_column
+        else
+          column += 1
+        end
+        index += 1
+      end
+      text[index..].to_s
+    end
+
     def strip_indent(line, columns)
       index = 0
       column = 0
@@ -526,7 +551,7 @@ module Beid
           index += 1
           next
         end
-        if line.text.start_with?("    ", "\t") || (@gfm && line.text.match?(/\A {0,3}\[\^[^\]]+\]:/))
+        if indented_code_start?(line.text) || (@gfm && line.text.match?(/\A {0,3}\[\^[^\]]+\]:/))
           index += 1
           next
         end

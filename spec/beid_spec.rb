@@ -90,6 +90,89 @@ RSpec.describe Beid do
       end
     end
 
+    it "recognizes tab-indented code and preserves its semantic code text" do
+      [
+        ["  \tfoo\tbaz\t\tbim\n", "foo\tbaz\t\tbim\n"],
+        ["\t\tbar\n", "\tbar\n"],
+        ["  \tfoo\n", "foo\n"]
+      ].each do |source, expected_text|
+        document = described_class.parse(source, gfm: false, front_matter: false)
+        code = document.root.children.fetch(0)
+
+        expect(code.type).to eq(:code_block)
+        expect(code.attributes[:text]).to eq(expected_text)
+        expect(document.source.byteslice(code.range)).to eq(source)
+        expect(document.to_s).to eq(source)
+      end
+    end
+
+    it "recognizes thematic breaks before list markers" do
+      ["- - -\n", "-     -      -      -\n", "*\t*\t*\t\n"].each do |source|
+        document = described_class.parse(source, gfm: false, front_matter: false)
+
+        expect(document.root.children.map(&:type)).to eq([:thematic_break])
+        expect(document.to_s).to eq(source)
+      end
+    end
+
+    it "treats escaped punctuation as text and exposes CommonMark line breaks" do
+      source = "\\*not emphasized*\nfoo\\\nbar\nspace  \nbaz\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      paragraph = document.root.children.fetch(0)
+
+      expect(paragraph.children.map(&:type)).to eq([
+        :text, :softbreak, :text, :linebreak, :text, :softbreak, :text, :linebreak, :text
+      ])
+      expect(paragraph.children.map { |node| node.attributes[:text] }.compact).to eq([
+        "*not emphasized*", "foo", "bar", "space", "baz"
+      ])
+      expect(document.source.byteslice(paragraph.children[3].range)).to eq("\\\n")
+      expect(document.source.byteslice(paragraph.children[7].range)).to eq("  \n")
+      expect(document.to_s).to eq(source)
+    end
+
+    it "recognizes inline HTML without parsing markup as Markdown text" do
+      source = "<span>*emphasis*</span> and <br />\n"
+      document = described_class.parse(source, gfm: false, front_matter: false)
+      paragraph = document.root.children.fetch(0)
+
+      expect(paragraph.children.map(&:type)).to eq([:html_inline, :emphasis, :html_inline, :text,
+                                                    :html_inline])
+      expect(paragraph.children.values_at(0, 2, 4).map { |node| node.attributes[:text] }).to eq([
+        "<span>", "</span>", "<br />"
+      ])
+      expect(paragraph.children.all? do |node|
+        paragraph.range.begin <= node.range.begin && node.range.end <= paragraph.range.end
+      end).to be(true)
+      expect(document.to_s).to eq(source)
+    end
+
+    it "applies CommonMark delimiter flanking and nested emphasis cases" do
+      [
+        ["a * foo bar*\n", []],
+        ["a*\"foo\"*\n", []],
+        ["foo*bar*\n", [:emphasis]],
+        ["foo_bar_\n", []],
+        ["_foo_bar_baz_\n", [:emphasis]],
+        ["*(*foo*)*\n", %i[emphasis emphasis]]
+      ].each do |source, expected_emphasis|
+        document = described_class.parse(source, gfm: false, front_matter: false)
+        emphasis_nodes = document.root.children.flat_map do |block|
+          stack = block.children.dup
+          found = []
+          until stack.empty?
+            node = stack.pop
+            found << node.type if %i[emphasis strong].include?(node.type)
+            stack.concat(node.children)
+          end
+          found
+        end
+
+        expect(emphasis_nodes.sort).to eq(expected_emphasis.sort)
+        expect(document.to_s).to eq(source)
+      end
+    end
+
     it "resolves reference links, collapsed references, images, and autolinks" do
       source = "[Guide][docs], [reference][], [shortcut], ![badge][img], <https://example.test/a?q=1>, <dev+bot@example.test>\n\n[DOCS]: /guides \"Quick guide\"\n[reference]: /reference\n[shortcut]: /short\n[img]: /badge.png\n"
       document = described_class.parse(source, gfm: false, front_matter: false)
@@ -138,16 +221,16 @@ RSpec.describe Beid do
       list = document.root.children.fetch(0)
       item = list.children.fetch(0)
       paragraph = item.children.fetch(0)
-      text = paragraph.children.fetch(0)
+      text, softbreak, continuation = paragraph.children
 
       expect(list.type).to eq(:list)
       expect(item.type).to eq(:list_item)
       expect(item.children.map(&:type)).to eq([:paragraph])
-      expect(text.attributes[:text]).to eq("a\ncontinuation")
+      expect([text.attributes[:text], softbreak.type, continuation.attributes[:text]]).to eq(["a", :softbreak, "continuation"])
       expect(item.range.begin).to be <= paragraph.range.begin
       expect(paragraph.range.end).to be <= item.range.end
       expect(paragraph.range.begin).to be <= text.range.begin
-      expect(text.range.end).to be <= paragraph.range.end
+      expect(continuation.range.end).to be <= paragraph.range.end
       expect(document.source.byteslice(item.range)).to eq(source)
       expect(document.to_s).to eq(source)
     end
@@ -158,7 +241,8 @@ RSpec.describe Beid do
       item = document.root.children.fetch(0).children.fetch(0)
 
       expect(item.children.map(&:type)).to eq(%i[paragraph block_quote code_block])
-      expect(item.children[0].children.first.attributes[:text]).to eq("a\ncontinuation")
+      expect(item.children[0].children.map(&:type)).to eq(%i[text softbreak text])
+      expect(item.children[0].children.map { |node| node.attributes[:text] }.compact.join).to eq("acontinuation")
       expect(item.children[1].children.map(&:type)).to eq(%i[paragraph paragraph])
       expect(item.children[1].children.map { |node| node.children.first.attributes[:text] }).to eq(["quoted", "body"])
       expect(item.children[2].attributes[:info]).to eq("rb")
@@ -180,7 +264,8 @@ RSpec.describe Beid do
       expect(heading.attributes[:level]).to eq(1)
       expect(heading.children.map { |node| node.attributes[:text] }.join).to eq("Foo")
       expect(paragraph.type).to eq(:paragraph)
-      expect(paragraph.children.map { |node| node.attributes[:text] }.join).to eq("bar\nbaz")
+      expect(paragraph.children.map(&:type)).to eq(%i[text softbreak text])
+      expect(paragraph.children.map { |node| node.attributes[:text] }.compact.join).to eq("barbaz")
       [heading, paragraph].each do |child|
         expect(quote.range.begin).to be <= child.range.begin
         expect(child.range.end).to be <= quote.range.end
