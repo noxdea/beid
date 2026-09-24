@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#020617">
+    <meta name="description" content="Beid edits Markdown by exact source range, preserving every untouched byte.">
+    <title>Beid — Edit Markdown without rewriting it</title>
+    <link rel="canonical" href="https://noxdea.github.io/beid/">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header shell">
+      <a class="wordmark" href="./" aria-label="Beid home">Beid<span aria-hidden="true">.</span></a>
+      <nav aria-label="Primary navigation">
+        <a href="#features">Features</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/noxdea/beid">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero shell" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="context">Markdown editing for Ruby</p>
+          <h1 id="hero-title">Edit Markdown without rewriting it.</h1>
+          <p class="lead">Beid changes the exact source range you choose. Everything else—spacing, syntax, and structure—stays as the author wrote it.</p>
+          <div class="actions">
+            <a class="button button-primary" href="#install">Get started</a>
+            <a class="button button-secondary" href="https://github.com/noxdea/beid#editing-api">Explore the API</a>
+          </div>
+        </div>
+
+        <figure class="artifact">
+          <figcaption>A heading edit leaves the rest of the source intact</figcaption>
+          <div class="source-pane">
+            <div class="source-label">Original source</div>
+            <pre><code><span class="changed"># Title</span>
+
+Keep this *formatting*.</code></pre>
+          </div>
+          <div class="operation">set_attribute(heading, :level, 2)</div>
+          <div class="source-pane">
+            <div class="source-label">Edited source</div>
+            <pre><code><span class="changed">## Title</span>
+
+Keep this *formatting*.</code></pre>
+          </div>
+        </figure>
+      </section>
+
+      <section class="section shell" id="features" aria-labelledby="features-title">
+        <div class="section-heading">
+          <h2 id="features-title">Changes that respect the file.</h2>
+          <p>Use the parse tree for targeted edits, while the original Markdown remains the source of truth.</p>
+        </div>
+        <div class="feature-list">
+          <article class="feature">
+            <h3>Exact round trips</h3>
+            <p>Read source-positioned nodes and return the original bytes with <code>Document#to_s</code>. Untouched formatting is never regenerated.</p>
+          </article>
+          <article class="feature">
+            <h3>Precise positions</h3>
+            <p>Work with half-open byte ranges, Unicode columns, and LSP UTF-16 positions for editor integrations.</p>
+          </article>
+          <article class="feature">
+            <h3>Immutable edits</h3>
+            <p>Replace, insert, remove, or move content. Each operation returns a new document, leaving the original unchanged.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section install shell" id="install" aria-labelledby="install-title">
+        <div class="section-heading">
+          <h2 id="install-title">Make one change. Keep the rest.</h2>
+          <p>Beid requires Ruby 3.1 or newer and has no runtime dependencies beyond the standard library.</p>
+        </div>
+        <div class="code-block">
+          <div class="code-caption">Install</div>
+          <pre><code>gem install beid</code></pre>
+        </div>
+        <div class="code-block">
+          <div class="code-caption">Edit a heading</div>
+          <pre><code>require "beid"
+
+source = "# Title\n\nKeep this *formatting*.\n"
+document = Beid::Document.parse(source)
+heading = document.root.children.first
+
+updated = Beid::Editing.set_attribute(document, heading, :level, 2)
+puts updated.to_s</code></pre>
+        </div>
+        <p class="more">Beid is an editing view, not an HTML renderer. <a href="https://github.com/noxdea/beid#editing-api">Read the editing API and limits</a>.</p>
+      </section>
+    </main>
+
+    <footer class="site-footer shell">
+      <span>Beid is open source under the MIT License.</span>
+      <div><a href="https://rubygems.org/gems/beid">RubyGems</a><a href="https://github.com/noxdea/beid">Source code</a></div>
+    </footer>
+  </body>
+</html>
