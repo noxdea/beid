@@ -1,43 +1,101 @@
-# Beid
+<h1 align="center">Beid</h1>
 
-Beid (ο¹ Eridani; Arabic *bayḍ*, “egg”) parses Markdown into a source-positioned tree and edits the original bytes in place. It is intended for applications that need to update part of a Markdown document without normalizing untouched formatting.
+<p align="center">
+  <strong>Source-preserving Markdown parser and editor with exact byte-range edits</strong>
+</p>
 
-Beid uses Ruby's standard library at runtime and supports Ruby 3.1 and later.
+<p align="center">
+  <a href="https://rubygems.org/gems/beid"><img src="https://img.shields.io/gem/v/beid.svg" alt="Gem version"></a>
+  <a href="https://github.com/noxdea/beid/actions/workflows/main.yml"><img src="https://github.com/noxdea/beid/actions/workflows/main.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/Ruby-%3E%3D%203.1-cc342d.svg" alt="Ruby 3.1 or newer">
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#installation">Installation</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#editing-api">Editing API</a> ·
+  <a href="#limits">Limits</a>
+</p>
+
+---
+
+Beid parses Markdown into source-positioned nodes and edits the original bytes
+without normalizing untouched formatting. It is for editors and document tools
+that need precise changes while preserving a user's Markdown. It uses only
+Ruby's standard library at runtime. Its name comes from Arabic *bayḍ*, “egg”
+(ο¹ Eridani).
+
+## Features
+
+- Exact source round trips: `Document#to_s` returns the original Markdown, not regenerated output
+- Half-open byte ranges for nodes, plus Unicode and LSP UTF-16 positions
+- Immutable editing operations that reparse only after splicing the requested source range
+- CommonMark and GFM-oriented parsing with front matter, tables, task lists, links, and directives
 
 ## Installation
 
-```ruby
-gem "beid"
+```sh
+gem install beid
 ```
 
-## Usage
+Beid requires Ruby 3.1 or newer. With Bundler, add `gem "beid"` to your Gemfile.
+
+## Quick start
 
 ```ruby
 require "beid"
 
 source = "# Title\n\nKeep this *formatting*.\n"
 document = Beid::Document.parse(source)
-paragraph = document.root.children.find { |node| node.type == :paragraph }
-
-updated = Beid::Editing.replace_text(document, paragraph, "A new sentence.")
-puts updated
-# # Title
-#
-# A new sentence.
-```
-
-`Document#source` and `#to_s` return the exact source string. Node ranges and all offsets are half-open byte ranges in that original UTF-8 string. `position_at` returns zero-based line and Unicode-codepoint column; `utf16_position_at` returns a zero-based LSP position. `nodes_at` returns the document-to-deepest-node path at a byte offset.
-
-`Beid::Editing` provides `replace`, `replace_text`, `insert_before`, `insert_after`, `remove`, `set_attribute`, `set_directive`, and `move`. Each operation returns a new parsed `Document`; the original remains unchanged. Edits splice only the requested byte range. Replacements are reparsed, and nodes from another document are rejected.
-
-```ruby
 heading = document.root.children.first
+
 updated = Beid::Editing.set_attribute(document, heading, :level, 2)
+puts updated.to_s
+# ## Title
+#
+# Keep this *formatting*.
 ```
 
-`Document.parse(text, gfm: true, front_matter: true)` retains YAML front matter as raw text, recognizes HTML-comment directives (`<!-- layout: two-column -->`), fenced code blocks, headings, paragraphs, nested lists, block quotes, tables, task-list items, strikethrough, and footnote references/definitions. `::: name` fenced divs are retained as directive nodes. Inline nodes include emphasis, strong emphasis, inline and reference links, autolinks, images, code spans, and text. Reference definitions are retained as `:link_definition` nodes and resolved link nodes carry their destination and source ranges.
+`updated` is a new document; `document` and its original source are unchanged.
 
-Beid does not evaluate YAML or render HTML. It is not a complete CommonMark/GFM implementation: unsupported or ambiguous syntax may be represented as plain text or raw HTML. The official CommonMark 0.31.2 fixture is bundled under `spec/fixtures/commonmark`. CI verifies exact source round-tripping and node byte ranges, and compares a test-only HTML rendering of Beid's tree with the fixture's expected output after HTML5 DOM normalization. The current semantic HTML DOM agreement is 620/652 (95.1%), meeting the design's 95% CommonMark semantic-conformance gate; the remaining mismatches are listed by section in CI output. Nokogiri is a development-only dependency for this oracle and is not a runtime gem dependency. Regardless of parser coverage, `Document#to_s` is an exact round trip because serialization returns the original source rather than regenerating Markdown from the tree. Treat the tree as a best-effort editing view and keep application-level edits within recognized node ranges.
+## Editing API
+
+Use `Document#nodes_at` to find the path from the document root to the deepest
+node at a byte offset. `Document#position_at` returns a zero-based line and
+Unicode-codepoint column; `#utf16_position_at` returns the corresponding LSP
+position. Ranges are half-open byte ranges in the original UTF-8 source.
+
+`Beid::Editing` supports `replace`, `replace_text`, `insert_before`,
+`insert_after`, `remove`, `set_attribute`, `set_directive`, and `move`. Each
+operation returns a newly parsed document. Nodes from a different document are
+rejected.
+
+`Document.parse(text, gfm: true, front_matter: true)` retains YAML front matter
+as raw text and recognizes headings, paragraphs, lists, block quotes, fenced
+code, tables, task lists, strikethrough, footnotes, links, images, and code
+spans. It also retains HTML-comment directives such as
+`<!-- layout: two-column -->` and `::: name` fenced divs. Reference definitions
+are kept as `:link_definition` nodes.
+
+## Limits
+
+Beid does not evaluate YAML or render HTML. Its parse tree is a best-effort
+editing view, not a complete CommonMark/GFM implementation: unsupported or
+ambiguous syntax may appear as plain text or raw HTML. Keep edits within
+recognized node ranges. Exact round-tripping does not depend on parser coverage
+because Beid returns the original source rather than reserializing the tree.
+
+The test suite covers all 652 official CommonMark 0.31.2 examples for exact
+source round trips and valid node ranges. Its test-only semantic HTML comparison
+currently agrees on 620/652 examples (95.1%); CI reports the remaining cases
+by section. Nokogiri is used only for that test oracle, not at runtime.
+
+## Documentation
+
+- [Byte-range editing decision](docs/adr/001-byte-range-edits.md)
+- [HTML-comment directive decision](docs/adr/002-html-comment-directives.md)
 
 ## Development
 
@@ -49,4 +107,4 @@ bundle exec rbs -I sig validate
 
 ## License
 
-MIT. See [LICENSE.txt](LICENSE.txt).
+Beid is released under the [MIT License](LICENSE.txt).
