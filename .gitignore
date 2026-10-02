@@ -6,6 +6,9 @@
 /pkg/
 /spec/reports/
 /tmp/
+/_site/
+/.jekyll-cache/
+/.jekyll-metadata
 
 # rspec failure tracking
 .rspec_status

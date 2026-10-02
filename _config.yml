@@ -1,0 +1,32 @@
+title: Beid
+description: Source-preserving Markdown parsing and editing for Ruby.
+url: https://noxdea.github.io
+baseurl: /beid
+repository: noxdea/beid
+markdown: kramdown
+plugins:
+  - jekyll-relative-links
+kramdown:
+  input: GFM
+  toc_levels: "2"
+defaults:
+  - scope:
+      path: docs
+      type: pages
+    values:
+      layout: guide
+exclude:
+  - README.md
+  - CHANGELOG.md
+  - LICENSE.txt
+  - Gemfile
+  - Gemfile.lock
+  - Rakefile
+  - beid.gemspec
+  - "*.gem"
+  - lib
+  - sig
+  - spec
+  - docs/adr
+  - tmp
+  - vendor

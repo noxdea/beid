@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#020617">
+    <meta name="description" content="{{ page.description | escape }}">
+    <meta property="og:title" content="{{ page.title | escape }} — Beid">
+    <meta property="og:description" content="{{ page.description | escape }}">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="{{ page.url | absolute_url }}">
+    <title>{{ page.title | escape }} — Beid</title>
+    <link rel="canonical" href="{{ page.url | absolute_url }}">
+    <link rel="stylesheet" href="{{ '/styles.css' | relative_url }}">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header shell">
+      <a class="wordmark" href="{{ '/' | relative_url }}" aria-label="Beid home">Beid<span aria-hidden="true">.</span></a>
+      <nav aria-label="Primary navigation">
+        <a href="{{ '/' | relative_url }}">Home</a>
+        <a href="{{ '/docs/' | relative_url }}" aria-current="true">User guide</a>
+        <a href="https://github.com/noxdea/beid">GitHub</a>
+      </nav>
+    </header>
+    <div class="docs-layout shell">
+      <aside class="docs-sidebar">
+        <nav aria-label="Guide navigation">
+          <a href="{{ '/docs/' | relative_url }}"{% if page.url == '/docs/' %} aria-current="page"{% endif %}>Getting started</a>
+          <a href="{{ '/docs/usage.html' | relative_url }}"{% if page.url == '/docs/usage.html' %} aria-current="page"{% endif %}>User guide</a>
+          <a href="{{ '/docs/development.html' | relative_url }}"{% if page.url == '/docs/development.html' %} aria-current="page"{% endif %}>Development</a>
+          <a href="https://github.com/noxdea/beid/blob/main/CHANGELOG.md">Changelog</a>
+        </nav>
+      </aside>
+      <main id="main" class="guide">
+        <article>{{ content | replace: '<pre ', '<pre tabindex="0" ' }}</article>
+      </main>
+    </div>
+    <footer class="site-footer shell">
+      <p>Beid is open source under the <a href="https://github.com/noxdea/beid/blob/main/LICENSE.txt">MIT License</a>.</p>
+      <a href="https://github.com/noxdea/beid/blob/main/{{ page.path }}">Edit this page on GitHub</a>
+    </footer>
+  </body>
+</html>
